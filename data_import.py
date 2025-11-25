@@ -20,6 +20,26 @@ def download_file(url: str, dest_path: str, chunk_size: int = 8192) -> None:
 
     try:
         with urllib.request.urlopen(url) as response, open(dest_path, "wb") as out_file:
+            # report on destination directory
+            dest_dir = os.path.dirname(dest_path) or "."
+            if os.path.isdir(dest_dir):
+                print(f"Destination directory found: {dest_dir}")
+            else:
+                print(f"Destination directory not found: {dest_dir}")
+
+            # report on response availability and HTTP status
+            if response:
+                status = None
+                try:
+                    status = response.getcode()
+                except Exception:
+                    status = getattr(response, "status", None)
+                if status is not None:
+                    print(f"Response received, HTTP status: {status}")
+                else:
+                    print("Response object received (no status code available).")
+            else:
+                print("No response received from URL.")
             while chunk := response.read(chunk_size):
                 out_file.write(chunk)
         print(f"Downloaded {url} -> {dest_path}")
@@ -103,10 +123,16 @@ def main() -> None:
     labels = f"{BASE_URL}/attachments/{labels}.gz"
 
     download_file(counts, os.path.join(args.output_dir, f"{args.name}.data.gz"))
+    data_filename = f"{args.name}.data.gz"
+    data_path = os.path.abspath(os.path.join(args.output_dir, data_filename))
+    print(f"Dataset saved to: {data_path}")
     if labels:
         download_file(
             labels, os.path.join(args.output_dir, f"{args.name}.input_labels.gz")
         )
+        labels_filename = f"{args.name}.input_labels.gz"
+        labels_path = os.path.abspath(os.path.join(args.output_dir, labels_filename))
+        print(f"Labels saved to: {labels_path}")
 
 
 if __name__ == "__main__":
