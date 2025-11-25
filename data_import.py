@@ -122,16 +122,14 @@ def main() -> None:
     counts = f"{BASE_URL}/data/{name}.gz"
     labels = f"{BASE_URL}/attachments/{labels}.gz"
 
-    download_file(counts, os.path.join(args.output_dir, f"{args.name}.data.gz"))
     data_filename = f"{args.name}.data.gz"
     data_path = os.path.abspath(os.path.join(args.output_dir, data_filename))
+    download_file(counts, data_path)
     print(f"Dataset saved to: {data_path}")
     if labels:
-        download_file(
-            labels, os.path.join(args.output_dir, f"{args.name}.input_labels.gz")
-        )
         labels_filename = f"{args.name}.input_labels.gz"
         labels_path = os.path.abspath(os.path.join(args.output_dir, labels_filename))
+        download_file(labels, labels_path)
         print(f"Labels saved to: {labels_path}")
 
 
