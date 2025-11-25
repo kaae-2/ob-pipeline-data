@@ -53,6 +53,18 @@ def download_file(url: str, dest_path: str, chunk_size: int = 8192) -> bool:
     return False
 
 
+def _str_to_bool(value: str) -> bool:
+    """Convert 'true'/'false' (case-insensitive) to bool or raise ArgumentTypeError."""
+    if isinstance(value, bool):
+        return value
+    val = str(value).strip().lower()
+    if val == "true":
+        return True
+    if val == "false":
+        return False
+    raise argparse.ArgumentTypeError("Invalid boolean value: must be 'true' or 'false'")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch omnibenchmark-ready datasets.")
     parser.add_argument(
@@ -67,10 +79,13 @@ def parse_args() -> argparse.Namespace:
         default="omni_dataset",
         help="Prefix for the saved files.",
     )
+
     parser.add_argument(
         "--transformed",
-        action="store_true",
-        help="If set, download the transformed variant instead of raw.",
+        type=_str_to_bool,
+        default=False,
+        help="If set to 'true', download the transformed variant instead of raw. Accepts 'true' or 'false'.",
+        metavar="true|false",
     )
     parser.add_argument(
         "--dataset_name",
