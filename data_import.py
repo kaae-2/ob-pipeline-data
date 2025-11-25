@@ -137,7 +137,8 @@ def main() -> None:
     labels = prepare_labels_name(args)
 
     counts = f"{BASE_URL}/data/{name}.gz"
-    labels = f"{BASE_URL}/attachments/{labels}.gz" if labels else None
+    # Attachments are plain text, not gzipped on the source; do not append .gz.
+    labels = f"{BASE_URL}/attachments/{labels}" if labels else None
 
     data_filename = f"{args.name}.data.gz"
     data_path = os.path.abspath(os.path.join(args.output_dir, data_filename))
