@@ -9,7 +9,7 @@ import urllib.request
 BASE_URL = "https://github.com/kaae-2/ob-flow-datasets/raw/main"
 
 
-def download_file(url: str, dest_path: str, chunk_size: int = 8192) -> None:
+def download_file(url: str, dest_path: str, chunk_size: int = 8192) -> bool:
     """
     Download a file from a URL to a destination path in chunks.
     """
@@ -43,12 +43,14 @@ def download_file(url: str, dest_path: str, chunk_size: int = 8192) -> None:
             while chunk := response.read(chunk_size):
                 out_file.write(chunk)
         print(f"Downloaded {url} -> {dest_path}")
+        return True
     except urllib.error.HTTPError as e:
         print(f"HTTP error for {url}: {e.code} {e.reason}")
     except urllib.error.URLError as e:
         print(f"Network error for {url}: {e.reason}")
     except Exception as e:
         print(f"Unexpected error for {url}: {e}")
+    return False
 
 
 def parse_args() -> argparse.Namespace:
@@ -89,9 +91,9 @@ def prepare_dataset_name(args):
     if not getattr(args, "dataset_name", None):
         raise ValueError("dataset_name must be provided")
     if args.transformed:
-        return f"{args.dataset_name}.fcs.gz"
+        return f"{args.dataset_name}.fcs"
     else:
-        return f"{args.dataset_name}_notransform.fcs.gz"
+        return f"{args.dataset_name}_notransform.fcs"
 
 
 def prepare_labels_name(args):
@@ -120,16 +122,18 @@ def main() -> None:
     labels = prepare_labels_name(args)
 
     counts = f"{BASE_URL}/data/{name}.gz"
-    labels = f"{BASE_URL}/attachments/{labels}.gz"
+    labels = f"{BASE_URL}/attachments/{labels}.gz" if labels else None
 
     data_filename = f"{args.name}.data.gz"
     data_path = os.path.abspath(os.path.join(args.output_dir, data_filename))
-    download_file(counts, data_path)
+    if not download_file(counts, data_path):
+        sys.exit(1)
     print(f"Dataset saved to: {data_path}")
     if labels:
         labels_filename = f"{args.name}.input_labels.gz"
         labels_path = os.path.abspath(os.path.join(args.output_dir, labels_filename))
-        download_file(labels, labels_path)
+        if not download_file(labels, labels_path):
+            sys.exit(1)
         print(f"Labels saved to: {labels_path}")
 
 
