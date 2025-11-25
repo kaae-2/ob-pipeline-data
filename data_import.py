@@ -6,7 +6,7 @@ import urllib.request
 
 # TODO: Point this to the repository that hosts your datasets.
 # The value below is just a placeholder and should be edited.
-BASE_URL = "https://github.com/kaae-2/ob-flow-datasets/blob/main"
+BASE_URL = "https://github.com/kaae-2/ob-flow-datasets/raw/main"
 
 
 def download_file(url: str, dest_path: str, chunk_size: int = 8192) -> None:
