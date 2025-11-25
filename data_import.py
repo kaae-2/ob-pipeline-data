@@ -104,7 +104,9 @@ def main() -> None:
 
     download_file(counts, os.path.join(args.output_dir, f"{args.name}.data.gz"))
     if labels:
-        download_file(labels, os.path.join(args.output_dir, f"{args.name}.labels.gz"))
+        download_file(
+            labels, os.path.join(args.output_dir, f"{args.name}.input_labels.gz")
+        )
 
 
 if __name__ == "__main__":
