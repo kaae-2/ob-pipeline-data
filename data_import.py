@@ -1,7 +1,11 @@
 import argparse
+import json
 import os
 import sys
+import tarfile
+import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # TODO: Point this to the repository that hosts your datasets.
@@ -65,6 +69,88 @@ def _str_to_bool(value: str) -> bool:
     raise argparse.ArgumentTypeError("Invalid boolean value: must be 'true' or 'false'")
 
 
+def _extract_repo_info(base_url: str):
+    """
+    Attempt to extract GitHub repo owner/repo/branch from a raw URL.
+    Returns a dict with keys owner, repo, branch or None if parsing fails.
+    """
+    parsed = urllib.parse.urlparse(base_url)
+    parts = parsed.path.strip("/").split("/")
+    if parsed.netloc == "github.com" and len(parts) >= 4 and parts[2] == "raw":
+        owner, repo, _, branch = parts[:4]
+        return {"owner": owner, "repo": repo, "branch": branch}
+    return None
+
+
+def _list_covid_files() -> list[dict]:
+    """
+    List the COVID folder contents on GitHub and return file metadata dicts.
+    Each dict contains 'name' and 'url'.
+    """
+    repo_info = _extract_repo_info(BASE_URL)
+    if not repo_info:
+        raise ValueError("BASE_URL must be a GitHub raw URL to list COVID files automatically.")
+
+    list_url = (
+        "https://api.github.com/repos/"
+        f"{repo_info['owner']}/{repo_info['repo']}/contents/data/covid"
+        f"?ref={repo_info['branch']}"
+    )
+
+    try:
+        with urllib.request.urlopen(list_url) as response:
+            payload = json.loads(response.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"HTTP error while listing COVID files: {e.code} {e.reason}") from e
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"Network error while listing COVID files: {e.reason}") from e
+    except Exception as e:
+        raise RuntimeError(f"Unexpected error while listing COVID files: {e}") from e
+
+    files = []
+    if isinstance(payload, list):
+        for item in payload:
+            if item.get("type") != "file":
+                continue
+            name = item.get("name")
+            if not name or not name.lower().endswith(".fcs"):
+                continue
+            download_url = item.get("download_url") or f"{BASE_URL}/data/covid/{name}"
+            files.append({"name": name, "url": download_url})
+    return files
+
+
+def download_covid_dataset(data_path: str) -> bool:
+    """
+    Download all FCS files in the COVID subfolder, then bundle them into a tar.gz.
+    """
+    try:
+        covid_files = _list_covid_files()
+    except Exception as exc:
+        print(exc)
+        return False
+
+    if not covid_files:
+        print("No COVID FCS files found in the source repository.")
+        return False
+
+    os.makedirs(os.path.dirname(data_path), exist_ok=True)
+    with tempfile.TemporaryDirectory() as tmpdir:
+        downloaded_paths = []
+        for file_info in covid_files:
+            dest = os.path.join(tmpdir, file_info["name"])
+            if not download_file(file_info["url"], dest):
+                return False
+            downloaded_paths.append(dest)
+
+        with tarfile.open(data_path, "w:gz") as tar:
+            for file_path in downloaded_paths:
+                tar.add(file_path, arcname=os.path.basename(file_path))
+
+    print(f"Downloaded and packaged {len(covid_files)} COVID files into {data_path}")
+    return True
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Fetch omnibenchmark-ready datasets.")
     parser.add_argument(
@@ -120,6 +206,8 @@ def prepare_labels_name(args):
         raise ValueError("dataset_name must be provided")
 
     ds = args.dataset_name.lower()
+    if ds == "covid":
+        return "01-May-2020_Human_COVID_analysis_template.wsp"
     if "levine" in ds or "samusik" in ds:
         # e.g. "Levine_13dim" -> "Levine_13dim_labels"
         return f"population_names_{args.dataset_name}.txt"
@@ -132,6 +220,23 @@ def prepare_labels_name(args):
 
 def main() -> None:
     args = parse_args()
+
+    if args.dataset_name.lower() == "covid":
+        data_filename = f"{args.name}.data.gz"
+        data_path = os.path.abspath(os.path.join(args.output_dir, data_filename))
+        if not download_covid_dataset(data_path):
+            sys.exit(1)
+        print(f"Dataset saved to: {data_path}")
+
+        labels = prepare_labels_name(args)
+        labels = f"{BASE_URL}/attachments/{labels}" if labels else None
+        if labels:
+            labels_filename = f"{args.name}.input_labels.gz"
+            labels_path = os.path.abspath(os.path.join(args.output_dir, labels_filename))
+            if not download_file(labels, labels_path):
+                sys.exit(1)
+            print(f"Labels saved to: {labels_path}")
+        return
 
     name = prepare_dataset_name(args)
     labels = prepare_labels_name(args)

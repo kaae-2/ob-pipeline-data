@@ -5,6 +5,6 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 
 python "${script_dir}/data_import.py" \
-  --dataset_name "Levine_13dim" \
+  --dataset_name "covid" \
   --name "data_import" \
   --output_dir "${script_dir}/out/data/data_import"
