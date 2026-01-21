@@ -8,10 +8,10 @@ if [[ ! -f "$archive" ]]; then
   exit 1
 fi
 
-echo "Listing FCS files in $archive..."
-tar -tzf "$archive" | tee /tmp/covid_fcs_list.txt
+echo "Listing CSV files in $archive..."
+tar -tzf "$archive" | tee /tmp/prepared_csv_list.txt
 
 echo
 echo "Summary:"
-echo "Total entries: $(wc -l < /tmp/covid_fcs_list.txt)"
-echo "Non-FCS entries (should be 0): $(grep -v -i '\.fcs$' /tmp/covid_fcs_list.txt | wc -l)"
+echo "Total entries: $(wc -l < /tmp/prepared_csv_list.txt)"
+echo "Non-CSV entries (should be 0): $(grep -v -i '\.csv$' /tmp/prepared_csv_list.txt | wc -l)"
