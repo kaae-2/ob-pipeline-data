@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-archive="${1:-out/data/data_import/data_import.data.gz}"
+archive="${1:-out/data/data_import/data_import.data.tar.gz}"
 
 if [[ ! -f "$archive" ]]; then
   echo "Archive not found: $archive" >&2

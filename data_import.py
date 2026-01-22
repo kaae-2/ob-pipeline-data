@@ -1,5 +1,5 @@
 import argparse
-import argparse
+import csv
 import gzip
 import json
 import os
@@ -45,6 +45,34 @@ def _extract_repo_info(base_url: str):
         owner, repo, _, branch = parts[:4]
         return {"owner": owner, "repo": repo, "branch": branch}
     return None
+
+
+def _validate_csv_file(path: Path) -> None:
+    size = path.stat().st_size
+    if size == 0:
+        raise ValueError("CSV file is empty.")
+
+    with open(path, "rb") as fh:
+        fh.seek(-1, os.SEEK_END)
+        if fh.read(1) != b"\n":
+            raise ValueError("CSV file does not end with a newline.")
+
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh)
+        try:
+            header = next(reader)
+        except StopIteration as exc:
+            raise ValueError("CSV file has no header row.") from exc
+
+        expected = len(header)
+        if expected == 0:
+            raise ValueError("CSV header has no columns.")
+
+        for idx, row in enumerate(reader, start=2):
+            if len(row) != expected:
+                raise ValueError(
+                    f"Row {idx} has {len(row)} columns (expected {expected})."
+                )
 
 
 def _list_prepared_files(dataset_name: str) -> list[dict]:
@@ -168,6 +196,16 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[li
 
             added.append(target)
 
+        for csv_path in added:
+            try:
+                _validate_csv_file(csv_path)
+            except ValueError as exc:
+                print(
+                    f"Validation failed for {csv_path.name}: {exc}",
+                    file=sys.stderr,
+                )
+                return None
+
         with tarfile.open(data_path, "w:gz") as tar:
             for p in sorted(added, key=lambda x: x.name):
                 tar.add(p, arcname=p.name)
@@ -218,7 +256,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     outdir = args.output_dir
-    data_filename = f"{args.name}.data.gz"
+    data_filename = f"{args.name}.data.tar.gz"
     data_path = os.path.abspath(os.path.join(outdir, data_filename))
 
     downloaded = _download_prepared_dataset(args.dataset_name, data_path)

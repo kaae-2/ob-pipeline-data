@@ -11,7 +11,7 @@ if [[ $# -lt 1 ]]; then
 fi
 
 DATASET_NAME="$1"
-# Use the dataset name as the output 'name' so produced tarball is `<name>.data.gz`.
+# Use the dataset name as the output 'name' so produced tarball is `<name>.data.tar.gz`.
 python "${script_dir}/data_import.py" \
   --dataset_name "${DATASET_NAME}" \
   --name "${DATASET_NAME}" \
