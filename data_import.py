@@ -53,10 +53,14 @@ def _validate_csv_file(path: Path) -> None:
     if size == 0:
         raise ValueError("CSV file is empty.")
 
-    with open(path, "rb") as fh:
+    with open(path, "rb+") as fh:
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            raise ValueError("CSV file is empty.")
         fh.seek(-1, os.SEEK_END)
         if fh.read(1) != b"\n":
-            raise ValueError("CSV file does not end with a newline.")
+            fh.seek(0, os.SEEK_END)
+            fh.write(b"\n")
 
     with open(path, "r", encoding="utf-8", newline="") as fh:
         reader = csv.reader(fh)
