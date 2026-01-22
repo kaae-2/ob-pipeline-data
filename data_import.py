@@ -113,7 +113,8 @@ def _list_prepared_files(dataset_name: str) -> list[dict]:
             if not (is_data or is_sha):
                 continue
             download_url = item.get("download_url") or f"{BASE_URL}/prepared/{dataset_name}/{name}"
-            files.append({"name": name, "url": download_url})
+            kind = "sha" if is_sha else "data"
+            files.append({"name": name, "url": download_url, "kind": kind})
     return files
 
 
@@ -174,7 +175,12 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[li
         downloaded_by_name = {p.name: p for p in downloaded_paths}
 
         by_base: dict[str, list[Path]] = {}
-        for p in downloaded_paths:
+        for item in prepared_files:
+            if item.get("kind") != "data":
+                continue
+            p = downloaded_by_name.get(item["name"])
+            if p is None:
+                continue
             base = p.name
             for s in (".csv", ".csv.gz", ".csv.zst"):
                 if base.lower().endswith(s):
@@ -240,6 +246,15 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[li
                 shutil.copy2(src, target)
 
             added.append(target)
+
+        bad_names = [p.name for p in added if ".sha256" in p.name]
+        if bad_names:
+            print(
+                "Error: checksum files were packaged as CSVs: "
+                + ", ".join(sorted(bad_names)),
+                file=sys.stderr,
+            )
+            return None
 
         for csv_path in added:
             try:
