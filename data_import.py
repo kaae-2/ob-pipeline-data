@@ -3,6 +3,7 @@ import argparse
 import gzip
 import json
 import os
+import random
 import shutil
 import sys
 import tarfile
@@ -85,16 +86,16 @@ def _list_prepared_files(dataset_name: str) -> list[dict]:
     return files
 
 
-def _download_prepared_dataset(dataset_name: str, data_path: str) -> bool:
+def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[list[Path]]:
     try:
         prepared_files = _list_prepared_files(dataset_name)
     except Exception as exc:
         print(exc)
-        return False
+        return None
 
     if not prepared_files:
         print(f"No prepared CSV files found in the source repository for '{dataset_name}'.")
-        return False
+        return None
 
     os.makedirs(os.path.dirname(data_path), exist_ok=True)
     tmpdir = tempfile.mkdtemp()
@@ -112,7 +113,7 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> bool:
         for item in prepared_files:
             dest = Path(tmpdir) / item["name"]
             if not download_file(item["url"], str(dest)):
-                return False
+                return None
             downloaded_paths.append(dest)
 
         by_base: dict[str, list[Path]] = {}
@@ -161,7 +162,7 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> bool:
                     print(
                         "Error: found .zst file but Python package 'zstandard' is not installed; cannot decompress."
                     )
-                    return False
+                    return None
             else:
                 shutil.copy2(src, target)
 
@@ -170,13 +171,8 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> bool:
         with tarfile.open(data_path, "w:gz") as tar:
             for p in sorted(added, key=lambda x: x.name):
                 tar.add(p, arcname=p.name)
-
-        labels_path = Path(data_path).with_name(Path(data_path).stem + ".input_labels.gz")
-        with gzip.open(labels_path, "wb") as lh:
-            lh.write(b"")
-        print(f"Wrote empty labels file: {labels_path}")
         print(f"Packaged {len(added)} CSV files into {data_path}")
-        return True
+        return added
     finally:
         shutil.rmtree(tmpdir)
 
@@ -204,6 +200,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Prepared dataset folder name under the GitHub repo prepared/ directory.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        required=True,
+        help="Random seed used to generate the file order output.",
+    )
 
     try:
         return parser.parse_args()
@@ -219,7 +221,19 @@ def main() -> None:
     data_filename = f"{args.name}.data.gz"
     data_path = os.path.abspath(os.path.join(outdir, data_filename))
 
-    if _download_prepared_dataset(args.dataset_name, data_path):
+    downloaded = _download_prepared_dataset(args.dataset_name, data_path)
+    if downloaded is not None:
+        attachments_path = os.path.abspath(os.path.join(outdir, f"{args.name}.attachments.gz"))
+        with gzip.open(attachments_path, "wb") as lh:
+            lh.write(b"")
+        print(f"Wrote empty attachments file: {attachments_path}")
+
+        order = list(range(1, len(downloaded) + 1))
+        random.Random(args.seed).shuffle(order)
+        order_path = os.path.abspath(os.path.join(outdir, f"{args.name}.order.json.gz"))
+        with gzip.open(order_path, "wt", encoding="utf-8") as oh:
+            json.dump({"order": order}, oh)
+        print(f"Wrote order file: {order_path}")
         print(f"Dataset saved to: {data_path}")
         return
 

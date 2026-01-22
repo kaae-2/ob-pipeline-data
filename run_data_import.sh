@@ -15,4 +15,5 @@ DATASET_NAME="$1"
 python "${script_dir}/data_import.py" \
   --dataset_name "${DATASET_NAME}" \
   --name "${DATASET_NAME}" \
+  --seed "42" \
   --output_dir "${script_dir}/out/data/data_import"
