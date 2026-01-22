@@ -1,6 +1,7 @@
 import argparse
 import csv
 import gzip
+import hashlib
 import json
 import os
 import random
@@ -105,13 +106,39 @@ def _list_prepared_files(dataset_name: str) -> list[dict]:
             if not name:
                 continue
             lower = name.lower()
-            if lower.endswith(".sha256"):
-                continue
-            if not (lower.endswith(".csv") or lower.endswith(".csv.gz") or lower.endswith(".csv.zst")):
+            is_data = lower.endswith(".csv") or lower.endswith(".csv.gz") or lower.endswith(
+                ".csv.zst"
+            )
+            is_sha = lower.endswith(".csv.zst.sha256")
+            if not (is_data or is_sha):
                 continue
             download_url = item.get("download_url") or f"{BASE_URL}/prepared/{dataset_name}/{name}"
             files.append({"name": name, "url": download_url})
     return files
+
+
+def _read_sha256(sha_path: Path) -> str:
+    text = sha_path.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError("SHA256 file is empty.")
+    return text.split()[0]
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _verify_sha256(path: Path, sha_path: Path) -> None:
+    expected = _read_sha256(sha_path)
+    actual = _file_sha256(path)
+    if actual != expected:
+        raise ValueError(
+            f"SHA256 mismatch (expected {expected}, got {actual})."
+        )
 
 
 def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[list[Path]]:
@@ -143,6 +170,8 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[li
             if not download_file(item["url"], str(dest)):
                 return None
             downloaded_paths.append(dest)
+
+        downloaded_by_name = {p.name: p for p in downloaded_paths}
 
         by_base: dict[str, list[Path]] = {}
         for p in downloaded_paths:
@@ -182,6 +211,22 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[li
                 with gzip.open(src, "rb") as fh_in, open(target, "wb") as fh_out:
                     shutil.copyfileobj(cast(BinaryIO, fh_in), fh_out)
             elif typ == "zst":
+                sha_name = f"{src.name}.sha256"
+                sha_path = downloaded_by_name.get(sha_name)
+                if sha_path is None:
+                    print(
+                        f"Error: missing checksum file {sha_name} for {src.name}.",
+                        file=sys.stderr,
+                    )
+                    return None
+                try:
+                    _verify_sha256(src, sha_path)
+                except ValueError as exc:
+                    print(
+                        f"Checksum failed for {src.name}: {exc}",
+                        file=sys.stderr,
+                    )
+                    return None
                 if zstd_available and zstd is not None:
                     with open(src, "rb") as fh_in, open(target, "wb") as fh_out:
                         dctx = zstd.ZstdDecompressor()

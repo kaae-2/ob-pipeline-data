@@ -17,3 +17,5 @@ python "${script_dir}/data_import.py" \
   --name "${DATASET_NAME}" \
   --seed "42" \
   --output_dir "${script_dir}/out/data/data_import"
+
+"${script_dir}/verify_data_import.sh" "${script_dir}/out/data/data_import/${DATASET_NAME}.data.tar.gz"
