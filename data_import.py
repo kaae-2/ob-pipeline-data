@@ -110,8 +110,11 @@ def _list_prepared_files(dataset_name: str) -> list[dict]:
             if not name:
                 continue
             lower = name.lower()
-            is_data = lower.endswith(".csv") or lower.endswith(".csv.gz") or lower.endswith(
-                ".csv.zst"
+            is_data = (
+                lower.endswith(".csv")
+                or lower.endswith(".csv.gz")
+                or lower.endswith(".csv.zst")
+                or ".csv.zst.part" in lower
             )
             is_sha = lower.endswith(".csv.zst.sha256")
             if not (is_data or is_sha):
@@ -186,10 +189,15 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[li
             if p is None:
                 continue
             base = p.name
-            for s in (".csv", ".csv.gz", ".csv.zst"):
-                if base.lower().endswith(s):
-                    base = base[: -len(s)]
-                    break
+            lower_name = p.name.lower()
+            part_marker = ".csv.zst.part"
+            if part_marker in lower_name:
+                base = p.name[: lower_name.index(part_marker)]
+            else:
+                for s in (".csv", ".csv.gz", ".csv.zst"):
+                    if lower_name.endswith(s):
+                        base = p.name[: -len(s)]
+                        break
             by_base.setdefault(base, []).append(p)
 
         for base, paths in sorted(by_base.items()):
@@ -209,18 +217,26 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[li
                         chosen = (p, "zst")
                         break
             if chosen is None:
+                part_marker = ".csv.zst.part"
+                parts = [p for p in paths if part_marker in p.name.lower()]
+                if parts:
+                    chosen = (parts, "zst_parts")
+            if chosen is None:
                 chosen = (paths[0], None)
 
-            src, typ = chosen
+            src_obj, typ = chosen
             arcname = f"{base}.csv"
             target = Path(tmpdir) / arcname
 
             if typ == "csv":
+                src = cast(Path, src_obj)
                 shutil.copy2(src, target)
             elif typ == "gz":
+                src = cast(Path, src_obj)
                 with gzip.open(src, "rb") as fh_in, open(target, "wb") as fh_out:
                     shutil.copyfileobj(cast(BinaryIO, fh_in), fh_out)
             elif typ == "zst":
+                src = cast(Path, src_obj)
                 sha_name = f"{src.name}.sha256"
                 sha_path = downloaded_by_name.get(sha_name)
                 if sha_path is None:
@@ -246,7 +262,40 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[li
                         "Error: found .zst file but Python package 'zstandard' is not installed; cannot decompress."
                     )
                     return None
+            elif typ == "zst_parts":
+                parts = cast(list[Path], src_obj)
+                temp_zst = Path(tmpdir) / f"{base}.csv.zst"
+                with open(temp_zst, "wb") as fh_out:
+                    for part in sorted(parts, key=lambda p: p.name):
+                        with open(part, "rb") as fh_in:
+                            shutil.copyfileobj(cast(BinaryIO, fh_in), fh_out)
+                sha_name = f"{temp_zst.name}.sha256"
+                sha_path = downloaded_by_name.get(sha_name)
+                if sha_path is None:
+                    print(
+                        f"Error: missing checksum file {sha_name} for {temp_zst.name}.",
+                        file=sys.stderr,
+                    )
+                    return None
+                try:
+                    _verify_sha256(temp_zst, sha_path)
+                except ValueError as exc:
+                    print(
+                        f"Checksum failed for {temp_zst.name}: {exc}",
+                        file=sys.stderr,
+                    )
+                    return None
+                if zstd_available and zstd is not None:
+                    with open(temp_zst, "rb") as fh_in, open(target, "wb") as fh_out:
+                        dctx = zstd.ZstdDecompressor()
+                        dctx.copy_stream(fh_in, fh_out)
+                else:
+                    print(
+                        "Error: found .zst parts but Python package 'zstandard' is not installed; cannot decompress."
+                    )
+                    return None
             else:
+                src = cast(Path, src_obj)
                 shutil.copy2(src, target)
 
             added.append(target)
