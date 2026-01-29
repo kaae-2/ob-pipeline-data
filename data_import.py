@@ -18,6 +18,15 @@ from typing import BinaryIO, Optional, cast
 # Base URL for raw downloads (GitHub raw endpoint via github.com)
 BASE_URL = "https://github.com/kaae-2/ob-flow-datasets/raw/main"
 
+LABEL_COLUMN_CANDIDATES = (
+    "label",
+    "population",
+    "cell_type",
+    "celltype",
+    "cluster",
+    "cluster_id",
+)
+
 
 def download_file(url: str, dest_path: str, chunk_size: int = 8192) -> bool:
     if not url or not dest_path:
@@ -149,7 +158,56 @@ def _verify_sha256(path: Path, sha_path: Path) -> None:
         )
 
 
-def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[list[Path]]:
+def _find_label_index(header: list[str]) -> Optional[int]:
+    lower_map = {str(col).strip().lower(): idx for idx, col in enumerate(header)}
+    for candidate in LABEL_COLUMN_CANDIDATES:
+        if candidate in lower_map:
+            return lower_map[candidate]
+    return None
+
+
+def _collect_dataset_metadata(csv_paths: list[Path]) -> dict:
+    sorted_paths = sorted(csv_paths, key=lambda p: p.name)
+    sample_names: list[str] = []
+    cells_per_sample: list[int] = []
+    populations: set[str] = set()
+
+    for path in sorted_paths:
+        with open(path, "r", encoding="utf-8", newline="") as fh:
+            reader = csv.reader(fh)
+            try:
+                header = next(reader)
+            except StopIteration as exc:
+                raise ValueError(f"CSV file has no header row: {path.name}") from exc
+            label_index = _find_label_index(header)
+            cell_count = 0
+            for row in reader:
+                cell_count += 1
+                if label_index is None:
+                    continue
+                if label_index >= len(row):
+                    continue
+                value = str(row[label_index]).strip()
+                if not value:
+                    continue
+                if value.lower() == "unlabeled":
+                    continue
+                populations.add(value)
+
+        sample_names.append(path.name)
+        cells_per_sample.append(cell_count)
+
+    return {
+        "sample_count": len(sorted_paths),
+        "sample_names": sample_names,
+        "cells_per_sample": cells_per_sample,
+        "population_count": len(populations),
+    }
+
+
+def _download_prepared_dataset(
+    dataset_name: str, data_path: str
+) -> Optional[tuple[list[Path], dict]]:
     try:
         prepared_files = _list_prepared_files(dataset_name)
     except Exception as exc:
@@ -319,11 +377,13 @@ def _download_prepared_dataset(dataset_name: str, data_path: str) -> Optional[li
                 )
                 return None
 
+        metadata = _collect_dataset_metadata(added)
+
         with tarfile.open(data_path, "w:gz") as tar:
             for p in sorted(added, key=lambda x: x.name):
                 tar.add(p, arcname=p.name)
         print(f"Packaged {len(added)} CSV files into {data_path}")
-        return added
+        return added, metadata
     finally:
         shutil.rmtree(tmpdir)
 
@@ -374,16 +434,17 @@ def main() -> None:
 
     downloaded = _download_prepared_dataset(args.dataset_name, data_path)
     if downloaded is not None:
+        csv_paths, metadata = downloaded
         attachments_path = os.path.abspath(os.path.join(outdir, f"{args.name}.attachments.gz"))
         with gzip.open(attachments_path, "wb") as lh:
             lh.write(b"")
         print(f"Wrote empty attachments file: {attachments_path}")
 
-        order = list(range(1, len(downloaded) + 1))
+        order = list(range(1, len(csv_paths) + 1))
         random.Random(args.seed).shuffle(order)
         order_path = os.path.abspath(os.path.join(outdir, f"{args.name}.order.json.gz"))
         with gzip.open(order_path, "wt", encoding="utf-8") as oh:
-            json.dump({"order": order}, oh)
+            json.dump({"order": order, "metadata": metadata}, oh)
         print(f"Wrote order file: {order_path}")
         print(f"Dataset saved to: {data_path}")
         return
