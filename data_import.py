@@ -417,6 +417,12 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Random seed used to generate the file order output.",
     )
+    parser.add_argument(
+        "--sub-sampling",
+        type=int,
+        default=0,
+        help="Record sub-sampling level (0 means no sub-sampling).",
+    )
 
     try:
         return parser.parse_args()
@@ -443,6 +449,7 @@ def main() -> None:
         order = list(range(1, len(csv_paths) + 1))
         random.Random(args.seed).shuffle(order)
         order_path = os.path.abspath(os.path.join(outdir, f"{args.name}.order.json.gz"))
+        metadata["sub_sampling"] = args.sub_sampling
         with gzip.open(order_path, "wt", encoding="utf-8") as oh:
             json.dump({"order": order, "metadata": metadata}, oh)
         print(f"Wrote order file: {order_path}")
