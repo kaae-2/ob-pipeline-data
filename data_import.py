@@ -171,6 +171,7 @@ def _collect_dataset_metadata(csv_paths: list[Path]) -> dict:
     sample_names: list[str] = []
     cells_per_sample: list[int] = []
     populations: set[str] = set()
+    expected_variables: Optional[int] = None
 
     for path in sorted_paths:
         with open(path, "r", encoding="utf-8", newline="") as fh:
@@ -180,6 +181,17 @@ def _collect_dataset_metadata(csv_paths: list[Path]) -> dict:
             except StopIteration as exc:
                 raise ValueError(f"CSV file has no header row: {path.name}") from exc
             label_index = _find_label_index(header)
+            if label_index is None:
+                n_variables = len(header)
+            else:
+                n_variables = len(header) - 1
+            if expected_variables is None:
+                expected_variables = n_variables
+            elif expected_variables != n_variables:
+                raise ValueError(
+                    "Inconsistent variable count: "
+                    f"{path.name} has {n_variables}, expected {expected_variables}."
+                )
             cell_count = 0
             for row in reader:
                 cell_count += 1
@@ -201,6 +213,7 @@ def _collect_dataset_metadata(csv_paths: list[Path]) -> dict:
         "sample_count": len(sorted_paths),
         "sample_names": sample_names,
         "cells_per_sample": cells_per_sample,
+        "n_variables": expected_variables if expected_variables is not None else 0,
         "population_count": len(populations),
     }
 
