@@ -30,6 +30,7 @@ LABEL_COLUMN_CANDIDATES = (
 
 DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 DOWNLOAD_MAX_WORKERS = 8
+DATA_TAR_GZIP_COMPRESSLEVEL = 1
 
 
 def download_file(url: str, dest_path: str, chunk_size: int = DOWNLOAD_CHUNK_SIZE) -> bool:
@@ -403,7 +404,11 @@ def _download_prepared_dataset(
             print(f"Validation failed: {exc}", file=sys.stderr)
             return None
 
-        with tarfile.open(data_path, "w:gz") as tar:
+        with tarfile.open(
+            data_path,
+            "w:gz",
+            compresslevel=DATA_TAR_GZIP_COMPRESSLEVEL,
+        ) as tar:
             for p in sorted(added, key=lambda x: x.name):
                 tar.add(p, arcname=p.name)
         print(f"Packaged {len(added)} CSV files into {data_path}")
