@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import BinaryIO, Optional, cast
+from typing import Any, BinaryIO, Optional, cast
 
 # Base URL for raw downloads (GitHub raw endpoint via github.com)
 BASE_URL = "https://github.com/kaae-2/ob-flow-datasets/raw/main"
@@ -30,6 +30,8 @@ LABEL_COLUMN_CANDIDATES = (
 
 DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 DOWNLOAD_MAX_WORKERS = 8
+NORMALIZE_MAX_WORKERS = 4
+METADATA_MAX_WORKERS = 4
 DATA_TAR_GZIP_COMPRESSLEVEL = 1
 
 
@@ -154,50 +156,82 @@ def _find_label_index(header: list[str]) -> Optional[int]:
     return None
 
 
+def _scan_csv_file(path: Path) -> dict:
+    _ensure_trailing_newline(path)
+
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        reader = csv.reader(fh)
+        try:
+            header = next(reader)
+        except StopIteration as exc:
+            raise ValueError(f"CSV file has no header row: {path.name}") from exc
+
+        label_index = _find_label_index(header)
+        n_variables = len(header) if label_index is None else len(header) - 1
+        cell_count = 0
+        populations: set[str] = set()
+
+        for row in reader:
+            cell_count += 1
+            if label_index is None or label_index >= len(row):
+                continue
+            value = str(row[label_index]).strip()
+            if not value or value.lower() == "unlabeled":
+                continue
+            populations.add(value)
+
+    return {
+        "sample_name": path.name,
+        "cell_count": cell_count,
+        "n_variables": n_variables,
+        "populations": populations,
+    }
+
+
 def _validate_and_collect_dataset_metadata(csv_paths: list[Path]) -> dict:
     sorted_paths = sorted(csv_paths, key=lambda p: p.name)
+    if not sorted_paths:
+        return {
+            "sample_count": 0,
+            "sample_names": [],
+            "cells_per_sample": [],
+            "n_variables": 0,
+            "population_count": 0,
+        }
+
     sample_names: list[str] = []
     cells_per_sample: list[int] = []
     populations: set[str] = set()
     expected_variables: Optional[int] = None
 
-    for path in sorted_paths:
-        _ensure_trailing_newline(path)
-
-        with open(path, "r", encoding="utf-8", newline="") as fh:
-            reader = csv.reader(fh)
+    scanned_by_name: dict[str, dict] = {}
+    max_workers = min(METADATA_MAX_WORKERS, len(sorted_paths))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_scan_csv_file, path): path
+            for path in sorted_paths
+        }
+        for future in as_completed(future_map):
+            path = future_map[future]
             try:
-                header = next(reader)
-            except StopIteration as exc:
-                raise ValueError(f"CSV file has no header row: {path.name}") from exc
-            label_index = _find_label_index(header)
-            if label_index is None:
-                n_variables = len(header)
-            else:
-                n_variables = len(header) - 1
-            if expected_variables is None:
-                expected_variables = n_variables
-            elif expected_variables != n_variables:
-                raise ValueError(
-                    "Inconsistent variable count: "
-                    f"{path.name} has {n_variables}, expected {expected_variables}."
-                )
-            cell_count = 0
-            for row in reader:
-                cell_count += 1
-                if label_index is None:
-                    continue
-                if label_index >= len(row):
-                    continue
-                value = str(row[label_index]).strip()
-                if not value:
-                    continue
-                if value.lower() == "unlabeled":
-                    continue
-                populations.add(value)
+                scanned_by_name[path.name] = future.result()
+            except Exception as exc:
+                raise ValueError(f"Failed metadata scan for {path.name}: {exc}") from exc
+
+    for path in sorted_paths:
+        scanned = scanned_by_name[path.name]
+        n_variables = int(scanned["n_variables"])
+        if expected_variables is None:
+            expected_variables = n_variables
+        elif expected_variables != n_variables:
+            raise ValueError(
+                "Inconsistent variable count: "
+                f"{path.name} has {n_variables}, expected {expected_variables}."
+            )
 
         sample_names.append(path.name)
-        cells_per_sample.append(cell_count)
+        cells_per_sample.append(int(scanned["cell_count"]))
+        populations.update(scanned["populations"])
 
     return {
         "sample_count": len(sorted_paths),
@@ -206,6 +240,104 @@ def _validate_and_collect_dataset_metadata(csv_paths: list[Path]) -> dict:
         "n_variables": expected_variables if expected_variables is not None else 0,
         "population_count": len(populations),
     }
+
+
+def _choose_prepared_source(paths: list[Path]):
+    chosen = None
+    for p in paths:
+        if p.name.lower().endswith(".csv") and not p.name.lower().endswith(".csv.gz"):
+            chosen = (p, "csv")
+            break
+    if chosen is None:
+        for p in paths:
+            if p.name.lower().endswith(".csv.gz"):
+                chosen = (p, "gz")
+                break
+    if chosen is None:
+        for p in paths:
+            if p.name.lower().endswith(".csv.zst"):
+                chosen = (p, "zst")
+                break
+    if chosen is None:
+        part_marker = ".csv.zst.part"
+        parts = [p for p in paths if part_marker in p.name.lower()]
+        if parts:
+            chosen = (parts, "zst_parts")
+    if chosen is None:
+        chosen = (paths[0], None)
+    return chosen
+
+
+def _materialize_prepared_csv(
+    base: str,
+    paths: list[Path],
+    downloaded_by_name: dict[str, Path],
+    tmpdir: str,
+    zstd_available: bool,
+    zstd_module: Optional[Any],
+) -> Path:
+    src_obj, typ = _choose_prepared_source(paths)
+    arcname = f"{base}.csv"
+    target = Path(tmpdir) / arcname
+
+    if typ == "csv":
+        src = cast(Path, src_obj)
+        if src.resolve() != target.resolve():
+            shutil.copy2(src, target)
+    elif typ == "gz":
+        src = cast(Path, src_obj)
+        with gzip.open(src, "rb") as fh_in, open(target, "wb") as fh_out:
+            shutil.copyfileobj(cast(BinaryIO, fh_in), fh_out)
+    elif typ == "zst":
+        src = cast(Path, src_obj)
+        sha_name = f"{src.name}.sha256"
+        sha_path = downloaded_by_name.get(sha_name)
+        if sha_path is None:
+            raise ValueError(f"Missing checksum file {sha_name} for {src.name}.")
+        _verify_sha256(src, sha_path)
+        if not zstd_available or zstd_module is None:
+            raise ValueError(
+                "Found .zst file but Python package 'zstandard' is not installed; cannot decompress."
+            )
+        with open(src, "rb") as fh_in, open(target, "wb") as fh_out:
+            dctx = zstd_module.ZstdDecompressor()
+            dctx.copy_stream(fh_in, fh_out)
+    elif typ == "zst_parts":
+        parts = cast(list[Path], src_obj)
+        temp_zst = Path(tmpdir) / f"{base}.csv.zst"
+        digest = hashlib.sha256()
+        with open(temp_zst, "wb") as fh_out:
+            for part in sorted(parts, key=lambda p: p.name):
+                with open(part, "rb") as fh_in:
+                    for chunk in iter(lambda: fh_in.read(1024 * 1024), b""):
+                        fh_out.write(chunk)
+                        digest.update(chunk)
+
+        sha_name = f"{temp_zst.name}.sha256"
+        sha_path = downloaded_by_name.get(sha_name)
+        if sha_path is None:
+            raise ValueError(f"Missing checksum file {sha_name} for {temp_zst.name}.")
+
+        expected = _read_sha256(sha_path)
+        actual = digest.hexdigest()
+        if actual != expected:
+            raise ValueError(
+                f"Checksum failed for {temp_zst.name}: expected {expected}, got {actual}."
+            )
+
+        if not zstd_available or zstd_module is None:
+            raise ValueError(
+                "Found .zst parts but Python package 'zstandard' is not installed; cannot decompress."
+            )
+        with open(temp_zst, "rb") as fh_in, open(target, "wb") as fh_out:
+            dctx = zstd_module.ZstdDecompressor()
+            dctx.copy_stream(fh_in, fh_out)
+    else:
+        src = cast(Path, src_obj)
+        if src.resolve() != target.resolve():
+            shutil.copy2(src, target)
+
+    return target
 
 
 def _download_prepared_dataset(
@@ -289,105 +421,40 @@ def _download_prepared_dataset(
                         break
             by_base.setdefault(base, []).append(p)
 
-        for base, paths in sorted(by_base.items()):
-            chosen = None
-            for p in paths:
-                if p.name.lower().endswith(".csv") and not p.name.lower().endswith(".csv.gz"):
-                    chosen = (p, "csv")
-                    break
-            if chosen is None:
-                for p in paths:
-                    if p.name.lower().endswith(".csv.gz"):
-                        chosen = (p, "gz")
-                        break
-            if chosen is None:
-                for p in paths:
-                    if p.name.lower().endswith(".csv.zst"):
-                        chosen = (p, "zst")
-                        break
-            if chosen is None:
-                part_marker = ".csv.zst.part"
-                parts = [p for p in paths if part_marker in p.name.lower()]
-                if parts:
-                    chosen = (parts, "zst_parts")
-            if chosen is None:
-                chosen = (paths[0], None)
+        if not by_base:
+            print(
+                f"No data files were resolved for prepared dataset '{dataset_name}'.",
+                file=sys.stderr,
+            )
+            return None
 
-            src_obj, typ = chosen
-            arcname = f"{base}.csv"
-            target = Path(tmpdir) / arcname
-
-            if typ == "csv":
-                src = cast(Path, src_obj)
-                shutil.copy2(src, target)
-            elif typ == "gz":
-                src = cast(Path, src_obj)
-                with gzip.open(src, "rb") as fh_in, open(target, "wb") as fh_out:
-                    shutil.copyfileobj(cast(BinaryIO, fh_in), fh_out)
-            elif typ == "zst":
-                src = cast(Path, src_obj)
-                sha_name = f"{src.name}.sha256"
-                sha_path = downloaded_by_name.get(sha_name)
-                if sha_path is None:
-                    print(
-                        f"Error: missing checksum file {sha_name} for {src.name}.",
-                        file=sys.stderr,
-                    )
-                    return None
+        normalize_workers = min(NORMALIZE_MAX_WORKERS, len(by_base))
+        normalization_failed = False
+        with ThreadPoolExecutor(max_workers=normalize_workers) as executor:
+            future_map = {
+                executor.submit(
+                    _materialize_prepared_csv,
+                    base,
+                    paths,
+                    downloaded_by_name,
+                    tmpdir,
+                    zstd_available,
+                    zstd,
+                ): base
+                for base, paths in sorted(by_base.items())
+            }
+            for future in as_completed(future_map):
+                base = future_map[future]
                 try:
-                    _verify_sha256(src, sha_path)
-                except ValueError as exc:
-                    print(
-                        f"Checksum failed for {src.name}: {exc}",
-                        file=sys.stderr,
-                    )
-                    return None
-                if zstd_available and zstd is not None:
-                    with open(src, "rb") as fh_in, open(target, "wb") as fh_out:
-                        dctx = zstd.ZstdDecompressor()
-                        dctx.copy_stream(fh_in, fh_out)
-                else:
-                    print(
-                        "Error: found .zst file but Python package 'zstandard' is not installed; cannot decompress."
-                    )
-                    return None
-            elif typ == "zst_parts":
-                parts = cast(list[Path], src_obj)
-                temp_zst = Path(tmpdir) / f"{base}.csv.zst"
-                with open(temp_zst, "wb") as fh_out:
-                    for part in sorted(parts, key=lambda p: p.name):
-                        with open(part, "rb") as fh_in:
-                            shutil.copyfileobj(cast(BinaryIO, fh_in), fh_out)
-                sha_name = f"{temp_zst.name}.sha256"
-                sha_path = downloaded_by_name.get(sha_name)
-                if sha_path is None:
-                    print(
-                        f"Error: missing checksum file {sha_name} for {temp_zst.name}.",
-                        file=sys.stderr,
-                    )
-                    return None
-                try:
-                    _verify_sha256(temp_zst, sha_path)
-                except ValueError as exc:
-                    print(
-                        f"Checksum failed for {temp_zst.name}: {exc}",
-                        file=sys.stderr,
-                    )
-                    return None
-                if zstd_available and zstd is not None:
-                    with open(temp_zst, "rb") as fh_in, open(target, "wb") as fh_out:
-                        dctx = zstd.ZstdDecompressor()
-                        dctx.copy_stream(fh_in, fh_out)
-                else:
-                    print(
-                        "Error: found .zst parts but Python package 'zstandard' is not installed; cannot decompress."
-                    )
-                    return None
-            else:
-                src = cast(Path, src_obj)
-                shutil.copy2(src, target)
+                    target = future.result()
+                except Exception as exc:
+                    print(f"Failed to normalize prepared file '{base}': {exc}", file=sys.stderr)
+                    normalization_failed = True
+                    continue
+                added.append(target)
 
-            added.append(target)
+        if normalization_failed:
+            return None
 
         bad_names = [p.name for p in added if ".sha256" in p.name]
         if bad_names:
