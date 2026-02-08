@@ -27,8 +27,10 @@ LABEL_COLUMN_CANDIDATES = (
     "cluster_id",
 )
 
+DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 
-def download_file(url: str, dest_path: str, chunk_size: int = 8192) -> bool:
+
+def download_file(url: str, dest_path: str, chunk_size: int = DOWNLOAD_CHUNK_SIZE) -> bool:
     if not url or not dest_path:
         raise ValueError("Both url and dest_path must be provided.")
 
@@ -57,7 +59,7 @@ def _extract_repo_info(base_url: str):
     return None
 
 
-def _validate_csv_file(path: Path) -> None:
+def _ensure_trailing_newline(path: Path) -> None:
     size = path.stat().st_size
     if size == 0:
         raise ValueError("CSV file is empty.")
@@ -70,23 +72,6 @@ def _validate_csv_file(path: Path) -> None:
         if fh.read(1) != b"\n":
             fh.seek(0, os.SEEK_END)
             fh.write(b"\n")
-
-    with open(path, "r", encoding="utf-8", newline="") as fh:
-        reader = csv.reader(fh)
-        try:
-            header = next(reader)
-        except StopIteration as exc:
-            raise ValueError("CSV file has no header row.") from exc
-
-        expected = len(header)
-        if expected == 0:
-            raise ValueError("CSV header has no columns.")
-
-        for idx, row in enumerate(reader, start=2):
-            if len(row) != expected:
-                raise ValueError(
-                    f"Row {idx} has {len(row)} columns (expected {expected})."
-                )
 
 
 def _list_prepared_files(dataset_name: str) -> list[dict]:
@@ -166,7 +151,7 @@ def _find_label_index(header: list[str]) -> Optional[int]:
     return None
 
 
-def _collect_dataset_metadata(csv_paths: list[Path]) -> dict:
+def _validate_and_collect_dataset_metadata(csv_paths: list[Path]) -> dict:
     sorted_paths = sorted(csv_paths, key=lambda p: p.name)
     sample_names: list[str] = []
     cells_per_sample: list[int] = []
@@ -174,6 +159,8 @@ def _collect_dataset_metadata(csv_paths: list[Path]) -> dict:
     expected_variables: Optional[int] = None
 
     for path in sorted_paths:
+        _ensure_trailing_newline(path)
+
         with open(path, "r", encoding="utf-8", newline="") as fh:
             reader = csv.reader(fh)
             try:
@@ -380,17 +367,11 @@ def _download_prepared_dataset(
             )
             return None
 
-        for csv_path in added:
-            try:
-                _validate_csv_file(csv_path)
-            except ValueError as exc:
-                print(
-                    f"Validation failed for {csv_path.name}: {exc}",
-                    file=sys.stderr,
-                )
-                return None
-
-        metadata = _collect_dataset_metadata(added)
+        try:
+            metadata = _validate_and_collect_dataset_metadata(added)
+        except ValueError as exc:
+            print(f"Validation failed: {exc}", file=sys.stderr)
+            return None
 
         with tarfile.open(data_path, "w:gz") as tar:
             for p in sorted(added, key=lambda x: x.name):
