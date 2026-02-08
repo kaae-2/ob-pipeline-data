@@ -12,6 +12,7 @@ import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import BinaryIO, Optional, cast
 
@@ -28,6 +29,7 @@ LABEL_COLUMN_CANDIDATES = (
 )
 
 DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
+DOWNLOAD_MAX_WORKERS = 8
 
 
 def download_file(url: str, dest_path: str, chunk_size: int = DOWNLOAD_CHUNK_SIZE) -> bool:
@@ -230,12 +232,40 @@ def _download_prepared_dataset(
         except Exception:
             zstd_available = False
 
-        downloaded_paths: list[Path] = []
-        for item in prepared_files:
-            dest = Path(tmpdir) / item["name"]
-            if not download_file(item["url"], str(dest)):
-                return None
-            downloaded_paths.append(dest)
+        download_specs = [
+            (item, Path(tmpdir) / item["name"])
+            for item in sorted(prepared_files, key=lambda payload: payload["name"])
+        ]
+        if not download_specs:
+            print(
+                f"No downloadable prepared files found for '{dataset_name}'.",
+                file=sys.stderr,
+            )
+            return None
+        max_workers = min(DOWNLOAD_MAX_WORKERS, len(download_specs))
+        failed_download = False
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(download_file, item["url"], str(dest)): (item, dest)
+                for item, dest in download_specs
+            }
+            for future in as_completed(future_map):
+                item, _ = future_map[future]
+                try:
+                    succeeded = future.result()
+                except Exception as exc:
+                    print(
+                        f"Unexpected error for {item['url']}: {exc}",
+                        file=sys.stderr,
+                    )
+                    failed_download = True
+                    continue
+                if not succeeded:
+                    failed_download = True
+        if failed_download:
+            return None
+
+        downloaded_paths = [dest for _, dest in download_specs]
 
         downloaded_by_name = {p.name: p for p in downloaded_paths}
 
