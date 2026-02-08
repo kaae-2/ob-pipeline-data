@@ -9,6 +9,7 @@ import shutil
 import sys
 import tarfile
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,6 +34,8 @@ DOWNLOAD_MAX_WORKERS = 8
 NORMALIZE_MAX_WORKERS = 4
 METADATA_MAX_WORKERS = 4
 DATA_TAR_GZIP_COMPRESSLEVEL = 1
+DOWNLOAD_RETRIES = 3
+DOWNLOAD_RETRY_BASE_SECONDS = 1.0
 
 
 def download_file(url: str, dest_path: str, chunk_size: int = DOWNLOAD_CHUNK_SIZE) -> bool:
@@ -40,18 +43,41 @@ def download_file(url: str, dest_path: str, chunk_size: int = DOWNLOAD_CHUNK_SIZ
         raise ValueError("Both url and dest_path must be provided.")
 
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-    try:
-        with urllib.request.urlopen(url) as response, open(dest_path, "wb") as out_file:
-            while chunk := response.read(chunk_size):
-                out_file.write(chunk)
-        print(f"Downloaded {url} -> {dest_path}")
-        return True
-    except urllib.error.HTTPError as e:
-        print(f"HTTP error for {url}: {e.code} {e.reason}")
-    except urllib.error.URLError as e:
-        print(f"Network error for {url}: {e.reason}")
-    except Exception as e:
-        print(f"Unexpected error for {url}: {e}")
+    for attempt in range(1, DOWNLOAD_RETRIES + 1):
+        try:
+            with urllib.request.urlopen(url) as response, open(dest_path, "wb") as out_file:
+                while chunk := response.read(chunk_size):
+                    out_file.write(chunk)
+            print(f"Downloaded {url} -> {dest_path}")
+            return True
+        except urllib.error.HTTPError as e:
+            should_retry = e.code in {429, 500, 502, 503, 504}
+            print(
+                f"HTTP error for {url} (attempt {attempt}/{DOWNLOAD_RETRIES}): {e.code} {e.reason}",
+                file=sys.stderr,
+            )
+            if not should_retry:
+                break
+        except urllib.error.URLError as e:
+            print(
+                f"Network error for {url} (attempt {attempt}/{DOWNLOAD_RETRIES}): {e.reason}",
+                file=sys.stderr,
+            )
+        except Exception as e:
+            print(
+                f"Unexpected error for {url} (attempt {attempt}/{DOWNLOAD_RETRIES}): {e}",
+                file=sys.stderr,
+            )
+
+        try:
+            if os.path.exists(dest_path):
+                os.remove(dest_path)
+        except OSError:
+            pass
+
+        if attempt < DOWNLOAD_RETRIES:
+            delay = DOWNLOAD_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+            time.sleep(delay)
     return False
 
 
