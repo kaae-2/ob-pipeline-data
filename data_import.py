@@ -572,6 +572,7 @@ def main() -> None:
         random.Random(args.seed).shuffle(order)
         order_path = os.path.abspath(os.path.join(outdir, f"{args.name}.order.json.gz"))
         metadata["sub_sampling"] = args.sub_sampling
+        metadata["dataset_name"] = args.dataset_name
         with gzip.open(order_path, "wt", encoding="utf-8") as oh:
             json.dump({"order": order, "metadata": metadata}, oh)
         print(f"Wrote order file: {order_path}")
