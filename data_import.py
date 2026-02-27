@@ -110,44 +110,95 @@ def _list_prepared_files(dataset_name: str) -> list[dict]:
     if not repo_info:
         raise ValueError("BASE_URL must be a GitHub raw URL to list prepared files.")
 
-    list_url = (
+    target_dataset = dataset_name.strip()
+
+    tree_url = (
         "https://api.github.com/repos/"
-        f"{repo_info['owner']}/{repo_info['repo']}/contents/prepared/{dataset_name}"
-        f"?ref={repo_info['branch']}"
+        f"{repo_info['owner']}/{repo_info['repo']}/git/trees/{repo_info['branch']}"
+        "?recursive=1"
     )
 
     try:
-        with urllib.request.urlopen(list_url) as response:
+        with urllib.request.urlopen(tree_url) as response:
             payload = json.loads(response.read())
     except urllib.error.HTTPError as e:
-        raise RuntimeError(f"HTTP error while listing prepared files: {e.code} {e.reason}") from e
+        raise RuntimeError(
+            f"HTTP error while listing prepared files: {e.code} {e.reason}"
+        ) from e
     except urllib.error.URLError as e:
         raise RuntimeError(f"Network error while listing prepared files: {e.reason}") from e
     except Exception as e:
         raise RuntimeError(f"Unexpected error while listing prepared files: {e}") from e
 
+    tree = payload.get("tree") if isinstance(payload, dict) else None
+    if not isinstance(tree, list):
+        return []
+
     files = []
-    if isinstance(payload, list):
-        for item in payload:
-            if item.get("type") != "file":
+    target_dataset_l = target_dataset.lower()
+    for item in tree:
+        if not isinstance(item, dict) or item.get("type") != "blob":
+            continue
+
+        repo_path = item.get("path")
+        if not isinstance(repo_path, str) or not repo_path.startswith("prepared/"):
+            continue
+
+        rel = repo_path[len("prepared/") :]
+        parts = rel.split("/")
+        if len(parts) == 2:
+            # Legacy flat layout: prepared/<dataset>/<file>
+            dataset_part, file_name = parts
+            shortname_part = None
+            if dataset_part.lower() != target_dataset_l:
                 continue
-            name = item.get("name")
-            if not name:
+        elif len(parts) == 4:
+            # New layout: prepared/<platform>/<dataset>/<shortname>/<file>
+            _platform, dataset_part, shortname_part, file_name = parts
+            if dataset_part.lower() != target_dataset_l:
                 continue
-            lower = name.lower()
-            is_data = (
-                lower.endswith(".csv")
-                or lower.endswith(".csv.gz")
-                or lower.endswith(".csv.zst")
-                or ".csv.zst.part" in lower
-            )
-            is_sha = lower.endswith(".csv.zst.sha256")
-            if not (is_data or is_sha):
-                continue
-            download_url = item.get("download_url") or f"{BASE_URL}/prepared/{dataset_name}/{name}"
-            kind = "sha" if is_sha else "data"
-            files.append({"name": name, "url": download_url, "kind": kind})
+        else:
+            continue
+
+        lower = file_name.lower()
+        is_data = (
+            lower.endswith(".csv")
+            or lower.endswith(".csv.gz")
+            or lower.endswith(".csv.zst")
+            or ".csv.zst.part" in lower
+        )
+        is_sha = lower.endswith(".csv.zst.sha256")
+        if not (is_data or is_sha):
+            continue
+
+        files.append(
+            {
+                "name": file_name,
+                "repo_path": repo_path,
+                "url": f"{BASE_URL}/{repo_path}",
+                "kind": "sha" if is_sha else "data",
+                "shortname": shortname_part,
+            }
+        )
     return files
+
+
+def _derive_expected_abbreviations(prepared_files: list[dict]) -> list[str]:
+    abbreviations: set[str] = set()
+    for item in prepared_files:
+        if item.get("kind") != "data":
+            continue
+        repo_path = str(item.get("repo_path", ""))
+        if not repo_path.startswith("prepared/"):
+            continue
+        rel = repo_path[len("prepared/") :]
+        parts = rel.split("/")
+        if len(parts) != 4:
+            continue
+        _platform, _dataset, shortname, _file_name = parts
+        if shortname:
+            abbreviations.add(shortname)
+    return sorted(abbreviations)
 
 
 def _read_sha256(sha_path: Path) -> str:
@@ -316,10 +367,12 @@ def _materialize_prepared_csv(
             shutil.copyfileobj(cast(BinaryIO, fh_in), fh_out)
     elif typ == "zst":
         src = cast(Path, src_obj)
-        sha_name = f"{src.name}.sha256"
-        sha_path = downloaded_by_name.get(sha_name)
-        if sha_path is None:
-            raise ValueError(f"Missing checksum file {sha_name} for {src.name}.")
+        sha_path = src.with_name(f"{src.name}.sha256")
+        if not sha_path.exists():
+            sha_name = f"{src.name}.sha256"
+            sha_path = downloaded_by_name.get(sha_name)
+        if sha_path is None or not Path(sha_path).exists():
+            raise ValueError(f"Missing checksum file {src.name}.sha256 for {src.name}.")
         _verify_sha256(src, sha_path)
         if not zstd_available or zstd_module is None:
             raise ValueError(
@@ -340,8 +393,10 @@ def _materialize_prepared_csv(
                         digest.update(chunk)
 
         sha_name = f"{temp_zst.name}.sha256"
-        sha_path = downloaded_by_name.get(sha_name)
-        if sha_path is None:
+        sha_path = parts[0].with_name(sha_name)
+        if not sha_path.exists():
+            sha_path = downloaded_by_name.get(sha_name)
+        if sha_path is None or not Path(sha_path).exists():
             raise ValueError(f"Missing checksum file {sha_name} for {temp_zst.name}.")
 
         expected = _read_sha256(sha_path)
@@ -392,8 +447,8 @@ def _download_prepared_dataset(
             zstd_available = False
 
         download_specs = [
-            (item, Path(tmpdir) / item["name"])
-            for item in sorted(prepared_files, key=lambda payload: payload["name"])
+            (item, Path(tmpdir) / item["repo_path"])
+            for item in sorted(prepared_files, key=lambda payload: payload["repo_path"])
         ]
         if not download_specs:
             print(
@@ -427,12 +482,15 @@ def _download_prepared_dataset(
         downloaded_paths = [dest for _, dest in download_specs]
 
         downloaded_by_name = {p.name: p for p in downloaded_paths}
+        downloaded_by_repo_path = {
+            item["repo_path"]: dest for item, dest in download_specs
+        }
 
         by_base: dict[str, list[Path]] = {}
         for item in prepared_files:
             if item.get("kind") != "data":
                 continue
-            p = downloaded_by_name.get(item["name"])
+            p = downloaded_by_repo_path.get(item["repo_path"])
             if p is None:
                 continue
             base = p.name
@@ -497,6 +555,31 @@ def _download_prepared_dataset(
             print(f"Validation failed: {exc}", file=sys.stderr)
             return None
 
+        platforms: set[str] = set()
+        shortnames: set[str] = set()
+        for item in prepared_files:
+            if item.get("kind") != "data":
+                continue
+            repo_path = str(item.get("repo_path", ""))
+            rel = repo_path[len("prepared/") :] if repo_path.startswith("prepared/") else ""
+            parts = rel.split("/") if rel else []
+            if len(parts) == 4:
+                platform, _dataset, shortname, _file_name = parts
+                platforms.add(platform)
+                shortnames.add(shortname)
+
+        if platforms:
+            metadata["platforms"] = sorted(platforms)
+            if len(platforms) == 1:
+                metadata["platform"] = next(iter(platforms))
+        if shortnames:
+            metadata["shortnames"] = sorted(shortnames)
+
+        abbreviations = _derive_expected_abbreviations(prepared_files)
+        metadata["expected_abbreviations"] = abbreviations
+        if len(abbreviations) == 1:
+            metadata["expected_abbreviation"] = abbreviations[0]
+
         with tarfile.open(
             data_path,
             "w:gz",
@@ -531,7 +614,10 @@ def parse_args() -> argparse.Namespace:
         "--dataset_name",
         type=str,
         required=True,
-        help="Prepared dataset folder name under the GitHub repo prepared/ directory.",
+        help=(
+            "Prepared dataset identifier (e.g. FR-FCM-Z3YR, FR-FCM-Z2KP). "
+            "Dataset files are resolved by traversing prepared/ recursively and matching the dataset segment."
+        ),
     )
     parser.add_argument(
         "--seed",
