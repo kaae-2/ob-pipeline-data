@@ -11,6 +11,37 @@ This module imports prepared datasets and packages them for the benchmark.
   - `{dataset}.order.json.gz`
   - `{dataset}.attachments.gz`
 
+## Prepared dataset contract
+
+`data_import.py` resolves files from the dataset repository by traversing:
+
+`prepared/<platform>/<dataset_name>/<shortname>/`
+
+where:
+
+- `platform` is `cytof` or `fcm`
+- `dataset_name` is the CLI `--dataset_name` value
+- `shortname` is a compact cohort/abbreviation label
+
+The importer currently expects:
+
+- data files: `*.csv.zst`
+- checksum files: `*.csv.zst.sha256`
+
+Validation rules at import time:
+
+- For a given `--dataset_name`, exactly one `platform` must be present.
+- For a given `--dataset_name`, exactly one `shortname` (abbreviation) must be present.
+- Import fails fast if either condition is violated.
+
+For each selected dataset, the importer verifies checksums, decompresses `.csv.zst` to CSV, and packages CSVs into `{name}.data.tar.gz`.
+
+The generated order metadata includes dataset-derived fields such as:
+
+- `platform` (single required value)
+- `expected_abbreviation` (single required value, derived from shortname)
+- `platforms` and `expected_abbreviations` are also emitted for compatibility and contain one item.
+
 ## Run locally
 
 From repo root:

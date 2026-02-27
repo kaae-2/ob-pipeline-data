@@ -5,7 +5,6 @@ import hashlib
 import json
 import os
 import random
-import shutil
 import sys
 import tarfile
 import tempfile
@@ -15,7 +14,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any, BinaryIO, Optional, cast
+from typing import Optional
 
 # Base URL for raw downloads (GitHub raw endpoint via github.com)
 BASE_URL = "https://github.com/kaae-2/ob-flow-datasets/raw/main"
@@ -146,27 +145,15 @@ def _list_prepared_files(dataset_name: str) -> list[dict]:
 
         rel = repo_path[len("prepared/") :]
         parts = rel.split("/")
-        if len(parts) == 2:
-            # Legacy flat layout: prepared/<dataset>/<file>
-            dataset_part, file_name = parts
-            shortname_part = None
-            if dataset_part.lower() != target_dataset_l:
-                continue
-        elif len(parts) == 4:
-            # New layout: prepared/<platform>/<dataset>/<shortname>/<file>
-            _platform, dataset_part, shortname_part, file_name = parts
-            if dataset_part.lower() != target_dataset_l:
-                continue
-        else:
+        if len(parts) != 4:
+            continue
+
+        platform_part, dataset_part, shortname_part, file_name = parts
+        if dataset_part.lower() != target_dataset_l:
             continue
 
         lower = file_name.lower()
-        is_data = (
-            lower.endswith(".csv")
-            or lower.endswith(".csv.gz")
-            or lower.endswith(".csv.zst")
-            or ".csv.zst.part" in lower
-        )
+        is_data = lower.endswith(".csv.zst")
         is_sha = lower.endswith(".csv.zst.sha256")
         if not (is_data or is_sha):
             continue
@@ -177,6 +164,8 @@ def _list_prepared_files(dataset_name: str) -> list[dict]:
                 "repo_path": repo_path,
                 "url": f"{BASE_URL}/{repo_path}",
                 "kind": "sha" if is_sha else "data",
+                "platform": platform_part,
+                "dataset": dataset_part,
                 "shortname": shortname_part,
             }
         )
@@ -184,21 +173,16 @@ def _list_prepared_files(dataset_name: str) -> list[dict]:
 
 
 def _derive_expected_abbreviations(prepared_files: list[dict]) -> list[str]:
-    abbreviations: set[str] = set()
-    for item in prepared_files:
-        if item.get("kind") != "data":
-            continue
-        repo_path = str(item.get("repo_path", ""))
-        if not repo_path.startswith("prepared/"):
-            continue
-        rel = repo_path[len("prepared/") :]
-        parts = rel.split("/")
-        if len(parts) != 4:
-            continue
-        _platform, _dataset, shortname, _file_name = parts
-        if shortname:
-            abbreviations.add(shortname)
+    abbreviations = {
+        str(item.get("shortname", "")).strip()
+        for item in prepared_files
+        if item.get("kind") == "data" and str(item.get("shortname", "")).strip()
+    }
     return sorted(abbreviations)
+
+
+def _expected_sha_repo_path(data_repo_path: str) -> str:
+    return f"{data_repo_path}.sha256"
 
 
 def _read_sha256(sha_path: Path) -> str:
@@ -319,104 +303,20 @@ def _validate_and_collect_dataset_metadata(csv_paths: list[Path]) -> dict:
     }
 
 
-def _choose_prepared_source(paths: list[Path]):
-    chosen = None
-    for p in paths:
-        if p.name.lower().endswith(".csv") and not p.name.lower().endswith(".csv.gz"):
-            chosen = (p, "csv")
-            break
-    if chosen is None:
-        for p in paths:
-            if p.name.lower().endswith(".csv.gz"):
-                chosen = (p, "gz")
-                break
-    if chosen is None:
-        for p in paths:
-            if p.name.lower().endswith(".csv.zst"):
-                chosen = (p, "zst")
-                break
-    if chosen is None:
-        part_marker = ".csv.zst.part"
-        parts = [p for p in paths if part_marker in p.name.lower()]
-        if parts:
-            chosen = (parts, "zst_parts")
-    if chosen is None:
-        chosen = (paths[0], None)
-    return chosen
-
-
 def _materialize_prepared_csv(
     base: str,
-    paths: list[Path],
-    downloaded_by_name: dict[str, Path],
+    zst_path: Path,
+    sha_path: Path,
     tmpdir: str,
-    zstd_available: bool,
-    zstd_module: Optional[Any],
+    zstd_module,
 ) -> Path:
-    src_obj, typ = _choose_prepared_source(paths)
     arcname = f"{base}.csv"
     target = Path(tmpdir) / arcname
 
-    if typ == "csv":
-        src = cast(Path, src_obj)
-        if src.resolve() != target.resolve():
-            shutil.copy2(src, target)
-    elif typ == "gz":
-        src = cast(Path, src_obj)
-        with gzip.open(src, "rb") as fh_in, open(target, "wb") as fh_out:
-            shutil.copyfileobj(cast(BinaryIO, fh_in), fh_out)
-    elif typ == "zst":
-        src = cast(Path, src_obj)
-        sha_path = src.with_name(f"{src.name}.sha256")
-        if not sha_path.exists():
-            sha_name = f"{src.name}.sha256"
-            sha_path = downloaded_by_name.get(sha_name)
-        if sha_path is None or not Path(sha_path).exists():
-            raise ValueError(f"Missing checksum file {src.name}.sha256 for {src.name}.")
-        _verify_sha256(src, sha_path)
-        if not zstd_available or zstd_module is None:
-            raise ValueError(
-                "Found .zst file but Python package 'zstandard' is not installed; cannot decompress."
-            )
-        with open(src, "rb") as fh_in, open(target, "wb") as fh_out:
-            dctx = zstd_module.ZstdDecompressor()
-            dctx.copy_stream(fh_in, fh_out)
-    elif typ == "zst_parts":
-        parts = cast(list[Path], src_obj)
-        temp_zst = Path(tmpdir) / f"{base}.csv.zst"
-        digest = hashlib.sha256()
-        with open(temp_zst, "wb") as fh_out:
-            for part in sorted(parts, key=lambda p: p.name):
-                with open(part, "rb") as fh_in:
-                    for chunk in iter(lambda: fh_in.read(1024 * 1024), b""):
-                        fh_out.write(chunk)
-                        digest.update(chunk)
-
-        sha_name = f"{temp_zst.name}.sha256"
-        sha_path = parts[0].with_name(sha_name)
-        if not sha_path.exists():
-            sha_path = downloaded_by_name.get(sha_name)
-        if sha_path is None or not Path(sha_path).exists():
-            raise ValueError(f"Missing checksum file {sha_name} for {temp_zst.name}.")
-
-        expected = _read_sha256(sha_path)
-        actual = digest.hexdigest()
-        if actual != expected:
-            raise ValueError(
-                f"Checksum failed for {temp_zst.name}: expected {expected}, got {actual}."
-            )
-
-        if not zstd_available or zstd_module is None:
-            raise ValueError(
-                "Found .zst parts but Python package 'zstandard' is not installed; cannot decompress."
-            )
-        with open(temp_zst, "rb") as fh_in, open(target, "wb") as fh_out:
-            dctx = zstd_module.ZstdDecompressor()
-            dctx.copy_stream(fh_in, fh_out)
-    else:
-        src = cast(Path, src_obj)
-        if src.resolve() != target.resolve():
-            shutil.copy2(src, target)
+    _verify_sha256(zst_path, sha_path)
+    with open(zst_path, "rb") as fh_in, open(target, "wb") as fh_out:
+        dctx = zstd_module.ZstdDecompressor()
+        dctx.copy_stream(fh_in, fh_out)
 
     return target
 
@@ -435,16 +335,17 @@ def _download_prepared_dataset(
         return None
 
     os.makedirs(os.path.dirname(data_path), exist_ok=True)
-    tmpdir = tempfile.mkdtemp()
     added = []
     try:
-        zstd = None  # type: Optional[object]
-        try:
-            import zstandard as zstd  # type: ignore
+        import zstandard as zstd  # type: ignore
+    except Exception:
+        print(
+            "Python package 'zstandard' is required to load prepared .csv.zst files.",
+            file=sys.stderr,
+        )
+        return None
 
-            zstd_available = True
-        except Exception:
-            zstd_available = False
+    with tempfile.TemporaryDirectory() as tmpdir:
 
         download_specs = [
             (item, Path(tmpdir) / item["repo_path"])
@@ -481,72 +382,61 @@ def _download_prepared_dataset(
 
         downloaded_paths = [dest for _, dest in download_specs]
 
-        downloaded_by_name = {p.name: p for p in downloaded_paths}
         downloaded_by_repo_path = {
             item["repo_path"]: dest for item, dest in download_specs
         }
 
-        by_base: dict[str, list[Path]] = {}
-        for item in prepared_files:
-            if item.get("kind") != "data":
-                continue
-            p = downloaded_by_repo_path.get(item["repo_path"])
-            if p is None:
-                continue
-            base = p.name
-            lower_name = p.name.lower()
-            part_marker = ".csv.zst.part"
-            if part_marker in lower_name:
-                base = p.name[: lower_name.index(part_marker)]
-            else:
-                for s in (".csv", ".csv.gz", ".csv.zst"):
-                    if lower_name.endswith(s):
-                        base = p.name[: -len(s)]
-                        break
-            by_base.setdefault(base, []).append(p)
-
-        if not by_base:
+        data_items = [item for item in prepared_files if item.get("kind") == "data"]
+        if not data_items:
             print(
                 f"No data files were resolved for prepared dataset '{dataset_name}'.",
                 file=sys.stderr,
             )
             return None
 
-        normalize_workers = min(NORMALIZE_MAX_WORKERS, len(by_base))
+        normalize_workers = min(NORMALIZE_MAX_WORKERS, len(data_items))
         normalization_failed = False
         with ThreadPoolExecutor(max_workers=normalize_workers) as executor:
             future_map = {
                 executor.submit(
                     _materialize_prepared_csv,
-                    base,
-                    paths,
-                    downloaded_by_name,
+                    Path(item["repo_path"]).name[: -len(".csv.zst")],
+                    downloaded_by_repo_path[item["repo_path"]],
+                    downloaded_by_repo_path[_expected_sha_repo_path(item["repo_path"])],
                     tmpdir,
-                    zstd_available,
                     zstd,
-                ): base
-                for base, paths in sorted(by_base.items())
+                ): item["repo_path"]
+                for item in sorted(data_items, key=lambda payload: payload["repo_path"])
+                if item["repo_path"] in downloaded_by_repo_path
+                and _expected_sha_repo_path(item["repo_path"]) in downloaded_by_repo_path
             }
+
+            missing = [
+                item["repo_path"]
+                for item in sorted(data_items, key=lambda payload: payload["repo_path"])
+                if _expected_sha_repo_path(item["repo_path"]) not in downloaded_by_repo_path
+            ]
+            if missing:
+                print(
+                    "Missing checksum files for prepared inputs: " + ", ".join(missing),
+                    file=sys.stderr,
+                )
+                return None
+
             for future in as_completed(future_map):
-                base = future_map[future]
+                repo_path = future_map[future]
                 try:
                     target = future.result()
                 except Exception as exc:
-                    print(f"Failed to normalize prepared file '{base}': {exc}", file=sys.stderr)
+                    print(
+                        f"Failed to normalize prepared file '{repo_path}': {exc}",
+                        file=sys.stderr,
+                    )
                     normalization_failed = True
                     continue
                 added.append(target)
 
         if normalization_failed:
-            return None
-
-        bad_names = [p.name for p in added if ".sha256" in p.name]
-        if bad_names:
-            print(
-                "Error: checksum files were packaged as CSVs: "
-                + ", ".join(sorted(bad_names)),
-                file=sys.stderr,
-            )
             return None
 
         try:
@@ -568,17 +458,29 @@ def _download_prepared_dataset(
                 platforms.add(platform)
                 shortnames.add(shortname)
 
-        if platforms:
-            metadata["platforms"] = sorted(platforms)
-            if len(platforms) == 1:
-                metadata["platform"] = next(iter(platforms))
+        if len(platforms) != 1:
+            print(
+                "Invalid dataset layout: expected exactly one platform for "
+                f"dataset '{dataset_name}', found {sorted(platforms)}.",
+                file=sys.stderr,
+            )
+            return None
+        metadata["platform"] = next(iter(platforms))
+        metadata["platforms"] = sorted(platforms)
+
         if shortnames:
             metadata["shortnames"] = sorted(shortnames)
 
         abbreviations = _derive_expected_abbreviations(prepared_files)
+        if len(abbreviations) != 1:
+            print(
+                "Invalid dataset layout: expected exactly one shortname/abbreviation "
+                f"for dataset '{dataset_name}', found {sorted(abbreviations)}.",
+                file=sys.stderr,
+            )
+            return None
+        metadata["expected_abbreviation"] = abbreviations[0]
         metadata["expected_abbreviations"] = abbreviations
-        if len(abbreviations) == 1:
-            metadata["expected_abbreviation"] = abbreviations[0]
 
         with tarfile.open(
             data_path,
@@ -589,8 +491,6 @@ def _download_prepared_dataset(
                 tar.add(p, arcname=p.name)
         print(f"Packaged {len(added)} CSV files into {data_path}")
         return added, metadata
-    finally:
-        shutil.rmtree(tmpdir)
 
 
 def parse_args() -> argparse.Namespace:
