@@ -16,6 +16,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+import pandas as pd
+
 # Base URL for raw downloads (GitHub raw endpoint via github.com)
 BASE_URL = "https://github.com/kaae-2/ob-flow-datasets/raw/main"
 
@@ -32,6 +35,7 @@ DOWNLOAD_CHUNK_SIZE = 8 * 1024 * 1024
 DOWNLOAD_MAX_WORKERS = 8
 NORMALIZE_MAX_WORKERS = 4
 METADATA_MAX_WORKERS = 4
+TRANSFORM_CHUNK_ROWS = 100_000
 DATA_TAR_GZIP_COMPRESSLEVEL = 1
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_RETRY_BASE_SECONDS = 1.0
@@ -217,6 +221,38 @@ def _find_label_index(header: list[str]) -> Optional[int]:
     return None
 
 
+def _transform_csv_with_arcsinh(path: Path, cofactor: float) -> None:
+    temp_path = path.with_name(f"{path.name}.transforming")
+    wrote_any_chunk = False
+
+    for chunk_index, chunk in enumerate(pd.read_csv(path, chunksize=TRANSFORM_CHUNK_ROWS)):
+        wrote_any_chunk = True
+        columns = [str(col) for col in chunk.columns]
+        label_index = _find_label_index(columns)
+        feature_columns = [
+            col for idx, col in enumerate(chunk.columns) if label_index is None or idx != label_index
+        ]
+
+        if feature_columns:
+            numeric_values = chunk.loc[:, feature_columns].apply(pd.to_numeric, errors="coerce")
+            transformed_values = np.arcsinh(
+                numeric_values.to_numpy(dtype=np.float64, copy=False) / cofactor
+            )
+            chunk.loc[:, feature_columns] = transformed_values
+
+        chunk.to_csv(
+            temp_path,
+            mode="w" if chunk_index == 0 else "a",
+            index=False,
+            header=chunk_index == 0,
+        )
+
+    if not wrote_any_chunk:
+        raise ValueError(f"CSV file has no rows: {path.name}")
+
+    temp_path.replace(path)
+
+
 def _scan_csv_file(path: Path) -> dict:
     _ensure_trailing_newline(path)
 
@@ -309,6 +345,7 @@ def _materialize_prepared_csv(
     sha_path: Path,
     tmpdir: str,
     zstd_module,
+    transformation_cofactor: Optional[float] = None,
 ) -> Path:
     arcname = f"{base}.csv"
     target = Path(tmpdir) / arcname
@@ -318,11 +355,14 @@ def _materialize_prepared_csv(
         dctx = zstd_module.ZstdDecompressor()
         dctx.copy_stream(fh_in, fh_out)
 
+    if transformation_cofactor is not None:
+        _transform_csv_with_arcsinh(target, transformation_cofactor)
+
     return target
 
 
 def _download_prepared_dataset(
-    dataset_name: str, data_path: str
+    dataset_name: str, data_path: str, transformation_cofactor: Optional[float] = None
 ) -> Optional[tuple[list[Path], dict]]:
     try:
         prepared_files = _list_prepared_files(dataset_name)
@@ -405,6 +445,7 @@ def _download_prepared_dataset(
                     downloaded_by_repo_path[_expected_sha_repo_path(item["repo_path"])],
                     tmpdir,
                     zstd,
+                    transformation_cofactor,
                 ): item["repo_path"]
                 for item in sorted(data_items, key=lambda payload: payload["repo_path"])
                 if item["repo_path"] in downloaded_by_repo_path
@@ -467,6 +508,7 @@ def _download_prepared_dataset(
             return None
         metadata["platform"] = next(iter(platforms))
         metadata["platforms"] = sorted(platforms)
+        metadata["transformation_cofactor"] = transformation_cofactor
 
         if shortnames:
             metadata["shortnames"] = sorted(shortnames)
@@ -531,6 +573,15 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Record sub-sampling level (0 means no sub-sampling).",
     )
+    parser.add_argument(
+        "--transformation-cofactor",
+        type=float,
+        default=None,
+        help=(
+            "Optional arcsinh cofactor. When set, apply arcsinh(x / cofactor) to all "
+            "non-label columns before packaging the imported CSVs."
+        ),
+    )
 
     try:
         return parser.parse_args()
@@ -542,11 +593,17 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.transformation_cofactor is not None and args.transformation_cofactor <= 0:
+        raise ValueError("--transformation-cofactor must be greater than 0 when provided.")
     outdir = args.output_dir
     data_filename = f"{args.name}.data.tar.gz"
     data_path = os.path.abspath(os.path.join(outdir, data_filename))
 
-    downloaded = _download_prepared_dataset(args.dataset_name, data_path)
+    downloaded = _download_prepared_dataset(
+        args.dataset_name,
+        data_path,
+        transformation_cofactor=args.transformation_cofactor,
+    )
     if downloaded is not None:
         csv_paths, metadata = downloaded
         attachments_path = os.path.abspath(os.path.join(outdir, f"{args.name}.attachments.gz"))
