@@ -582,6 +582,15 @@ def parse_args() -> argparse.Namespace:
             "non-label columns before packaging the imported CSVs."
         ),
     )
+    parser.add_argument(
+        "--potential-batches",
+        type=int,
+        default=None,
+        help=(
+            "Optional count of potential batches present in the dataset. "
+            "When set, record it in order metadata for downstream stages."
+        ),
+    )
 
     try:
         return parser.parse_args()
@@ -595,6 +604,8 @@ def main() -> None:
     args = parse_args()
     if args.transformation_cofactor is not None and args.transformation_cofactor <= 0:
         raise ValueError("--transformation-cofactor must be greater than 0 when provided.")
+    if args.potential_batches is not None and args.potential_batches <= 0:
+        raise ValueError("--potential-batches must be greater than 0 when provided.")
     outdir = args.output_dir
     data_filename = f"{args.name}.data.tar.gz"
     data_path = os.path.abspath(os.path.join(outdir, data_filename))
@@ -616,6 +627,7 @@ def main() -> None:
         order_path = os.path.abspath(os.path.join(outdir, f"{args.name}.order.json.gz"))
         metadata["sub_sampling"] = args.sub_sampling
         metadata["dataset_name"] = args.dataset_name
+        metadata["potential_batches"] = args.potential_batches
         with gzip.open(order_path, "wt", encoding="utf-8") as oh:
             json.dump({"order": order, "metadata": metadata}, oh)
         print(f"Wrote order file: {order_path}")

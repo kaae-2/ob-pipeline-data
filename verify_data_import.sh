@@ -32,5 +32,6 @@ metadata = payload.get('metadata', {})
 print(f"dataset_name: {metadata.get('dataset_name')}")
 print(f"sub_sampling: {metadata.get('sub_sampling')}")
 print(f"transformation_cofactor: {metadata.get('transformation_cofactor')}")
+print(f"potential_batches: {metadata.get('potential_batches')}")
 PY
 fi

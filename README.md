@@ -41,6 +41,7 @@ The generated order metadata includes dataset-derived fields such as:
 - `platform` (single required value)
 - `expected_abbreviation` (single required value, derived from shortname)
 - `platforms` and `expected_abbreviations` are also emitted for compatibility and contain one item.
+- optional `transformation_cofactor` and `potential_batches` values when those CLI flags are provided
 
 ## Run locally
 
@@ -53,7 +54,7 @@ bash data/run_data_import.sh
 Or call the CLI directly:
 
 ```bash
-python data/data_import.py --dataset_name FR-FCM-Z3YR --name FR-FCM-Z3YR --seed 42 --output_dir data/out/data/data_import
+python data/data_import.py --dataset_name FR-FCM-Z3YR --name FR-FCM-Z3YR --seed 42 --potential-batches 3 --output_dir data/out/data/data_import
 ```
 
 ## Run as part of benchmark
