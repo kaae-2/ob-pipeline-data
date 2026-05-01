@@ -19,4 +19,4 @@ python "${script_dir}/data_import.py" \
 
 "${script_dir}/verify_data_import.sh" \
   "${script_dir}/out/data/data_import/${DATASET_NAME}.data.tar.gz" \
-  "${script_dir}/out/data/data_import/${DATASET_NAME}.order.json.gz"
+  "${script_dir}/out/data/data_import/${DATASET_NAME}.metadata.json.gz"

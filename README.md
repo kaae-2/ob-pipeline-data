@@ -8,7 +8,7 @@ This module imports prepared datasets and packages them for the benchmark.
 - Local runner: `run_data_import.sh`
 - Output artifacts:
   - `{dataset}.data.tar.gz`
-  - `{dataset}.order.json.gz`
+  - `{dataset}.metadata.json.gz`
   - `{dataset}.attachments.gz`
 
 ## Prepared dataset contract

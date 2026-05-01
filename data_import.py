@@ -44,6 +44,75 @@ UNLABELED_VALUES = {"", "unlabeled", "ungated", "debris", "unknown", "other", "n
 IMPORT_MANIFEST_SUFFIX = ".manifest.json"
 
 
+def _copy_json_object(value):
+    return json.loads(json.dumps(value))
+
+
+def _populate_metadata_legacy_aliases(payload: dict) -> dict:
+    dataset = payload.get("dataset")
+    samples = payload.get("samples")
+    labels = payload.get("labels")
+    stages = payload.get("stages")
+
+    legacy_metadata = dict(dataset) if isinstance(dataset, dict) else {}
+    if isinstance(samples, dict):
+        for key in ("sample_names", "cells_per_sample", "sample_count"):
+            if key in samples:
+                legacy_metadata[key] = _copy_json_object(samples[key])
+    if isinstance(stages, dict):
+        stratify = stages.get("stratify")
+        if isinstance(stratify, dict) and "stratification" in stratify:
+            legacy_metadata["stratification"] = _copy_json_object(
+                stratify["stratification"]
+            )
+
+    payload["metadata"] = legacy_metadata
+    if isinstance(samples, dict) and "order" in samples:
+        payload["order"] = _copy_json_object(samples["order"])
+    if isinstance(labels, dict):
+        if "id_to_label" in labels:
+            payload["id_to_label"] = _copy_json_object(labels["id_to_label"])
+        if "label_to_id" in labels:
+            payload["label_to_id"] = _copy_json_object(labels["label_to_id"])
+    return payload
+
+
+def _build_metadata_payload(
+    dataset_metadata: dict,
+    dataset_name: str,
+    order: list[int],
+    seed: int,
+    sub_sampling: int,
+    potential_batches: Optional[int],
+) -> dict:
+    dataset = dict(dataset_metadata)
+    dataset["dataset_name"] = dataset_name
+    dataset["sub_sampling"] = sub_sampling
+    dataset["potential_batches"] = potential_batches
+
+    payload = {
+        "schema_version": 1,
+        "dataset": dataset,
+        "samples": {
+            "order": [int(item) for item in order],
+            "sample_names": _copy_json_object(dataset_metadata.get("sample_names", [])),
+            "cells_per_sample": _copy_json_object(
+                dataset_metadata.get("cells_per_sample", [])
+            ),
+            "sample_count": int(dataset_metadata.get("sample_count", len(order))),
+        },
+        "labels": {
+            "non_target_aliases": sorted(UNLABELED_VALUES),
+        },
+        "stages": {
+            "data_import": {
+                "seed": int(seed),
+            }
+        },
+    }
+    return _populate_metadata_legacy_aliases(payload)
+
+
 def download_file(
     url: str, dest_path: str, chunk_size: int = DOWNLOAD_CHUNK_SIZE
 ) -> bool:
@@ -347,8 +416,11 @@ def _reuse_packaged_dataset_if_valid(
         return None
 
     manifest_checksums = manifest.get("source_checksums")
-    metadata = manifest.get("metadata")
-    if not isinstance(manifest_checksums, dict) or not isinstance(metadata, dict):
+    metadata_payload = manifest.get("metadata_payload")
+    if (
+        not isinstance(manifest_checksums, dict)
+        or not isinstance(metadata_payload, dict)
+    ):
         return None
     if manifest.get("dataset_name") != dataset_name:
         return None
@@ -357,14 +429,15 @@ def _reuse_packaged_dataset_if_valid(
     if manifest_checksums != source_checksums:
         return None
 
-    sample_names = metadata.get("sample_names")
+    samples = metadata_payload.get("samples")
+    sample_names = samples.get("sample_names") if isinstance(samples, dict) else None
     if not isinstance(sample_names, list) or not all(
         isinstance(name, str) for name in sample_names
     ):
         return None
 
     print(f"Reusing existing packaged dataset at {data_path}")
-    return [Path(name) for name in sample_names], metadata
+    return [Path(name) for name in sample_names], metadata_payload
 
 
 def _download_all(download_specs: list[tuple[dict, Path]]) -> bool:
@@ -600,7 +673,7 @@ def _download_prepared_dataset(
             return None
 
         try:
-            metadata = _build_dataset_metadata(sample_summaries)
+            dataset_metadata = _build_dataset_metadata(sample_summaries)
         except ValueError as exc:
             print(f"Validation failed: {exc}", file=sys.stderr)
             return None
@@ -629,12 +702,12 @@ def _download_prepared_dataset(
                 file=sys.stderr,
             )
             return None
-        metadata["platform"] = next(iter(platforms))
-        metadata["platforms"] = sorted(platforms)
-        metadata["transformation_cofactor"] = transformation_cofactor
+        dataset_metadata["platform"] = next(iter(platforms))
+        dataset_metadata["platforms"] = sorted(platforms)
+        dataset_metadata["transformation_cofactor"] = transformation_cofactor
 
         if shortnames:
-            metadata["shortnames"] = sorted(shortnames)
+            dataset_metadata["shortnames"] = sorted(shortnames)
 
         abbreviations = _derive_expected_abbreviations(prepared_files)
         if len(abbreviations) != 1:
@@ -644,8 +717,8 @@ def _download_prepared_dataset(
                 file=sys.stderr,
             )
             return None
-        metadata["expected_abbreviation"] = abbreviations[0]
-        metadata["expected_abbreviations"] = abbreviations
+        dataset_metadata["expected_abbreviation"] = abbreviations[0]
+        dataset_metadata["expected_abbreviations"] = abbreviations
 
         with tarfile.open(
             data_path,
@@ -660,11 +733,45 @@ def _download_prepared_dataset(
                 "dataset_name": dataset_name,
                 "transformation_cofactor": transformation_cofactor,
                 "source_checksums": source_checksums,
-                "metadata": metadata,
+                "metadata_payload": {
+                    "schema_version": 1,
+                    "dataset": dataset_metadata,
+                    "samples": {
+                        "sample_names": _copy_json_object(
+                            dataset_metadata.get("sample_names", [])
+                        ),
+                        "cells_per_sample": _copy_json_object(
+                            dataset_metadata.get("cells_per_sample", [])
+                        ),
+                        "sample_count": int(
+                            dataset_metadata.get("sample_count", len(added))
+                        ),
+                    },
+                    "labels": {
+                        "non_target_aliases": sorted(UNLABELED_VALUES),
+                    },
+                    "stages": {"data_import": {}},
+                },
             },
         )
         print(f"Packaged {len(added)} CSV files into {data_path}")
-        return added, metadata
+        return added, _populate_metadata_legacy_aliases(
+            {
+                "schema_version": 1,
+                "dataset": dataset_metadata,
+                "samples": {
+                    "sample_names": _copy_json_object(
+                        dataset_metadata.get("sample_names", [])
+                    ),
+                    "cells_per_sample": _copy_json_object(
+                        dataset_metadata.get("cells_per_sample", [])
+                    ),
+                    "sample_count": int(dataset_metadata.get("sample_count", len(added))),
+                },
+                "labels": {"non_target_aliases": sorted(UNLABELED_VALUES)},
+                "stages": {"data_import": {}},
+            }
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -720,7 +827,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help=(
             "Optional count of potential batches present in the dataset. "
-            "When set, record it in order metadata for downstream stages."
+            "When set, record it in dataset metadata for downstream stages."
         ),
     )
 
@@ -760,13 +867,20 @@ def main() -> None:
 
         order = list(range(1, len(csv_paths) + 1))
         random.Random(args.seed).shuffle(order)
-        order_path = os.path.abspath(os.path.join(outdir, f"{args.name}.order.json.gz"))
-        metadata["sub_sampling"] = args.sub_sampling
-        metadata["dataset_name"] = args.dataset_name
-        metadata["potential_batches"] = args.potential_batches
-        with gzip.open(order_path, "wt", encoding="utf-8") as oh:
-            json.dump({"order": order, "metadata": metadata}, oh)
-        print(f"Wrote order file: {order_path}")
+        metadata_path = os.path.abspath(
+            os.path.join(outdir, f"{args.name}.metadata.json.gz")
+        )
+        metadata_payload = _build_metadata_payload(
+            dataset_metadata=metadata["dataset"] if "dataset" in metadata else metadata,
+            dataset_name=args.dataset_name,
+            order=order,
+            seed=args.seed,
+            sub_sampling=args.sub_sampling,
+            potential_batches=args.potential_batches,
+        )
+        with gzip.open(metadata_path, "wt", encoding="utf-8") as oh:
+            json.dump(metadata_payload, oh, indent=2)
+        print(f"Wrote metadata file: {metadata_path}")
         print(f"Dataset saved to: {data_path}")
         return
 
