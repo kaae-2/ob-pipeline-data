@@ -2,6 +2,7 @@ import argparse
 import csv
 import gzip
 import hashlib
+import io
 import json
 import os
 import random
@@ -39,16 +40,23 @@ TRANSFORM_CHUNK_ROWS = 100_000
 DATA_TAR_GZIP_COMPRESSLEVEL = 1
 DOWNLOAD_RETRIES = 3
 DOWNLOAD_RETRY_BASE_SECONDS = 1.0
+UNLABELED_VALUES = {"", "unlabeled", "ungated", "debris", "unknown", "other", "noise"}
+IMPORT_MANIFEST_SUFFIX = ".manifest.json"
 
 
-def download_file(url: str, dest_path: str, chunk_size: int = DOWNLOAD_CHUNK_SIZE) -> bool:
+def download_file(
+    url: str, dest_path: str, chunk_size: int = DOWNLOAD_CHUNK_SIZE
+) -> bool:
     if not url or not dest_path:
         raise ValueError("Both url and dest_path must be provided.")
 
     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
     for attempt in range(1, DOWNLOAD_RETRIES + 1):
         try:
-            with urllib.request.urlopen(url) as response, open(dest_path, "wb") as out_file:
+            with (
+                urllib.request.urlopen(url) as response,
+                open(dest_path, "wb") as out_file,
+            ):
                 while chunk := response.read(chunk_size):
                     out_file.write(chunk)
             print(f"Downloaded {url} -> {dest_path}")
@@ -129,7 +137,9 @@ def _list_prepared_files(dataset_name: str) -> list[dict]:
             f"HTTP error while listing prepared files: {e.code} {e.reason}"
         ) from e
     except urllib.error.URLError as e:
-        raise RuntimeError(f"Network error while listing prepared files: {e.reason}") from e
+        raise RuntimeError(
+            f"Network error while listing prepared files: {e.reason}"
+        ) from e
     except Exception as e:
         raise RuntimeError(f"Unexpected error while listing prepared files: {e}") from e
 
@@ -208,9 +218,7 @@ def _verify_sha256(path: Path, sha_path: Path) -> None:
     expected = _read_sha256(sha_path)
     actual = _file_sha256(path)
     if actual != expected:
-        raise ValueError(
-            f"SHA256 mismatch (expected {expected}, got {actual})."
-        )
+        raise ValueError(f"SHA256 mismatch (expected {expected}, got {actual}).")
 
 
 def _find_label_index(header: list[str]) -> Optional[int]:
@@ -221,36 +229,14 @@ def _find_label_index(header: list[str]) -> Optional[int]:
     return None
 
 
-def _transform_csv_with_arcsinh(path: Path, cofactor: float) -> None:
-    temp_path = path.with_name(f"{path.name}.transforming")
-    wrote_any_chunk = False
-
-    for chunk_index, chunk in enumerate(pd.read_csv(path, chunksize=TRANSFORM_CHUNK_ROWS)):
-        wrote_any_chunk = True
-        columns = [str(col) for col in chunk.columns]
-        label_index = _find_label_index(columns)
-        feature_columns = [
-            col for idx, col in enumerate(chunk.columns) if label_index is None or idx != label_index
-        ]
-
-        if feature_columns:
-            numeric_values = chunk.loc[:, feature_columns].apply(pd.to_numeric, errors="coerce")
-            transformed_values = np.arcsinh(
-                numeric_values.to_numpy(dtype=np.float64, copy=False) / cofactor
-            )
-            chunk.loc[:, feature_columns] = transformed_values
-
-        chunk.to_csv(
-            temp_path,
-            mode="w" if chunk_index == 0 else "a",
-            index=False,
-            header=chunk_index == 0,
-        )
-
-    if not wrote_any_chunk:
-        raise ValueError(f"CSV file has no rows: {path.name}")
-
-    temp_path.replace(path)
+def _normalize_population_value(value: object) -> str:
+    if isinstance(value, (str, bytes)):
+        return str(value).strip()
+    if value is None or value is pd.NA:
+        return ""
+    if isinstance(value, (float, np.floating)) and np.isnan(value):
+        return ""
+    return str(value).strip()
 
 
 def _scan_csv_file(path: Path) -> dict:
@@ -285,9 +271,11 @@ def _scan_csv_file(path: Path) -> dict:
     }
 
 
-def _validate_and_collect_dataset_metadata(csv_paths: list[Path]) -> dict:
-    sorted_paths = sorted(csv_paths, key=lambda p: p.name)
-    if not sorted_paths:
+def _build_dataset_metadata(sample_summaries: list[dict]) -> dict:
+    sorted_summaries = sorted(
+        sample_summaries, key=lambda summary: str(summary["sample_name"])
+    )
+    if not sorted_summaries:
         return {
             "sample_count": 0,
             "sample_names": [],
@@ -301,42 +289,108 @@ def _validate_and_collect_dataset_metadata(csv_paths: list[Path]) -> dict:
     populations: set[str] = set()
     expected_variables: Optional[int] = None
 
-    scanned_by_name: dict[str, dict] = {}
-    max_workers = min(METADATA_MAX_WORKERS, len(sorted_paths))
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(_scan_csv_file, path): path
-            for path in sorted_paths
-        }
-        for future in as_completed(future_map):
-            path = future_map[future]
-            try:
-                scanned_by_name[path.name] = future.result()
-            except Exception as exc:
-                raise ValueError(f"Failed metadata scan for {path.name}: {exc}") from exc
-
-    for path in sorted_paths:
-        scanned = scanned_by_name[path.name]
-        n_variables = int(scanned["n_variables"])
+    for summary in sorted_summaries:
+        n_variables = int(summary["n_variables"])
         if expected_variables is None:
             expected_variables = n_variables
         elif expected_variables != n_variables:
             raise ValueError(
                 "Inconsistent variable count: "
-                f"{path.name} has {n_variables}, expected {expected_variables}."
+                f"{summary['sample_name']} has {n_variables}, expected {expected_variables}."
             )
 
-        sample_names.append(path.name)
-        cells_per_sample.append(int(scanned["cell_count"]))
-        populations.update(scanned["populations"])
+        sample_names.append(str(summary["sample_name"]))
+        cells_per_sample.append(int(summary["cell_count"]))
+        populations.update(summary["populations"])
 
     return {
-        "sample_count": len(sorted_paths),
+        "sample_count": len(sorted_summaries),
         "sample_names": sample_names,
         "cells_per_sample": cells_per_sample,
         "n_variables": expected_variables if expected_variables is not None else 0,
         "population_count": len(populations),
     }
+
+
+def _import_manifest_path(data_path: str) -> Path:
+    return Path(f"{data_path}{IMPORT_MANIFEST_SUFFIX}")
+
+
+def _load_import_manifest(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _write_import_manifest(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(f"{path.name}.tmp")
+    temp_path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    temp_path.replace(path)
+
+
+def _reuse_packaged_dataset_if_valid(
+    dataset_name: str,
+    data_path: str,
+    transformation_cofactor: Optional[float],
+    source_checksums: dict[str, str],
+) -> Optional[tuple[list[Path], dict]]:
+    manifest_path = _import_manifest_path(data_path)
+    manifest = _load_import_manifest(manifest_path)
+    if manifest is None or not Path(data_path).exists():
+        return None
+
+    manifest_checksums = manifest.get("source_checksums")
+    metadata = manifest.get("metadata")
+    if not isinstance(manifest_checksums, dict) or not isinstance(metadata, dict):
+        return None
+    if manifest.get("dataset_name") != dataset_name:
+        return None
+    if manifest.get("transformation_cofactor") != transformation_cofactor:
+        return None
+    if manifest_checksums != source_checksums:
+        return None
+
+    sample_names = metadata.get("sample_names")
+    if not isinstance(sample_names, list) or not all(
+        isinstance(name, str) for name in sample_names
+    ):
+        return None
+
+    print(f"Reusing existing packaged dataset at {data_path}")
+    return [Path(name) for name in sample_names], metadata
+
+
+def _download_all(download_specs: list[tuple[dict, Path]]) -> bool:
+    if not download_specs:
+        return True
+    max_workers = min(DOWNLOAD_MAX_WORKERS, len(download_specs))
+    failed_download = False
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(download_file, item["url"], str(dest)): (item, dest)
+            for item, dest in download_specs
+        }
+        for future in as_completed(future_map):
+            item, _ = future_map[future]
+            try:
+                succeeded = future.result()
+            except Exception as exc:
+                print(
+                    f"Unexpected error for {item['url']}: {exc}",
+                    file=sys.stderr,
+                )
+                failed_download = True
+                continue
+            if not succeeded:
+                failed_download = True
+    return not failed_download
 
 
 def _materialize_prepared_csv(
@@ -346,19 +400,81 @@ def _materialize_prepared_csv(
     tmpdir: str,
     zstd_module,
     transformation_cofactor: Optional[float] = None,
-) -> Path:
+) -> tuple[Path, dict]:
     arcname = f"{base}.csv"
     target = Path(tmpdir) / arcname
 
     _verify_sha256(zst_path, sha_path)
-    with open(zst_path, "rb") as fh_in, open(target, "wb") as fh_out:
+    wrote_any_chunk = False
+    cell_count = 0
+    n_variables: Optional[int] = None
+    populations: set[str] = set()
+
+    with open(zst_path, "rb") as fh_in:
         dctx = zstd_module.ZstdDecompressor()
-        dctx.copy_stream(fh_in, fh_out)
+        with (
+            dctx.stream_reader(fh_in) as reader,
+            io.TextIOWrapper(reader, encoding="utf-8", newline="") as text_reader,
+        ):
+            for chunk_index, chunk in enumerate(
+                pd.read_csv(text_reader, chunksize=TRANSFORM_CHUNK_ROWS)
+            ):
+                wrote_any_chunk = True
+                columns = [str(col) for col in chunk.columns]
+                label_index = _find_label_index(columns)
+                current_n_variables = (
+                    len(columns) if label_index is None else len(columns) - 1
+                )
+                if n_variables is None:
+                    n_variables = current_n_variables
+                elif n_variables != current_n_variables:
+                    raise ValueError(
+                        f"Inconsistent variable count within {arcname}: "
+                        f"{current_n_variables} vs {n_variables}."
+                    )
 
-    if transformation_cofactor is not None:
-        _transform_csv_with_arcsinh(target, transformation_cofactor)
+                feature_columns = [
+                    col
+                    for idx, col in enumerate(chunk.columns)
+                    if label_index is None or idx != label_index
+                ]
 
-    return target
+                if label_index is not None:
+                    label_series = chunk.iloc[:, label_index]
+                    normalized = label_series.map(_normalize_population_value)
+                    populations.update(
+                        value
+                        for value in normalized.unique().tolist()
+                        if value and value.lower() not in UNLABELED_VALUES
+                    )
+
+                if transformation_cofactor is not None and feature_columns:
+                    numeric_values = chunk.loc[:, feature_columns].apply(
+                        pd.to_numeric, errors="coerce"
+                    )
+                    transformed_values = np.arcsinh(
+                        numeric_values.to_numpy(dtype=np.float64, copy=False)
+                        / transformation_cofactor
+                    )
+                    chunk.loc[:, feature_columns] = transformed_values
+
+                cell_count += len(chunk)
+                chunk.to_csv(
+                    target,
+                    mode="w" if chunk_index == 0 else "a",
+                    index=False,
+                    header=chunk_index == 0,
+                )
+
+    if not wrote_any_chunk:
+        raise ValueError(f"CSV file has no rows: {arcname}")
+
+    return target, {
+        "sample_name": target.name,
+        "cell_count": cell_count,
+        "n_variables": n_variables if n_variables is not None else 0,
+        "populations": populations,
+    }
 
 
 def _download_prepared_dataset(
@@ -371,7 +487,9 @@ def _download_prepared_dataset(
         return None
 
     if not prepared_files:
-        print(f"No prepared CSV files found in the source repository for '{dataset_name}'.")
+        print(
+            f"No prepared CSV files found in the source repository for '{dataset_name}'."
+        )
         return None
 
     os.makedirs(os.path.dirname(data_path), exist_ok=True)
@@ -386,41 +504,38 @@ def _download_prepared_dataset(
         return None
 
     with tempfile.TemporaryDirectory() as tmpdir:
+        checksum_specs = [
+            (item, Path(tmpdir) / item["repo_path"])
+            for item in sorted(prepared_files, key=lambda payload: payload["repo_path"])
+            if item.get("kind") == "sha"
+        ]
+        if not checksum_specs:
+            print(
+                f"No checksum files found for prepared dataset '{dataset_name}'.",
+                file=sys.stderr,
+            )
+            return None
+        if not _download_all(checksum_specs):
+            return None
+
+        source_checksums = {
+            item["repo_path"]: _read_sha256(dest) for item, dest in checksum_specs
+        }
+        reused = _reuse_packaged_dataset_if_valid(
+            dataset_name,
+            data_path,
+            transformation_cofactor,
+            source_checksums,
+        )
+        if reused is not None:
+            return reused
 
         download_specs = [
             (item, Path(tmpdir) / item["repo_path"])
             for item in sorted(prepared_files, key=lambda payload: payload["repo_path"])
         ]
-        if not download_specs:
-            print(
-                f"No downloadable prepared files found for '{dataset_name}'.",
-                file=sys.stderr,
-            )
+        if not _download_all(download_specs):
             return None
-        max_workers = min(DOWNLOAD_MAX_WORKERS, len(download_specs))
-        failed_download = False
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(download_file, item["url"], str(dest)): (item, dest)
-                for item, dest in download_specs
-            }
-            for future in as_completed(future_map):
-                item, _ = future_map[future]
-                try:
-                    succeeded = future.result()
-                except Exception as exc:
-                    print(
-                        f"Unexpected error for {item['url']}: {exc}",
-                        file=sys.stderr,
-                    )
-                    failed_download = True
-                    continue
-                if not succeeded:
-                    failed_download = True
-        if failed_download:
-            return None
-
-        downloaded_paths = [dest for _, dest in download_specs]
 
         downloaded_by_repo_path = {
             item["repo_path"]: dest for item, dest in download_specs
@@ -436,6 +551,7 @@ def _download_prepared_dataset(
 
         normalize_workers = min(NORMALIZE_MAX_WORKERS, len(data_items))
         normalization_failed = False
+        sample_summaries: list[dict] = []
         with ThreadPoolExecutor(max_workers=normalize_workers) as executor:
             future_map = {
                 executor.submit(
@@ -449,13 +565,15 @@ def _download_prepared_dataset(
                 ): item["repo_path"]
                 for item in sorted(data_items, key=lambda payload: payload["repo_path"])
                 if item["repo_path"] in downloaded_by_repo_path
-                and _expected_sha_repo_path(item["repo_path"]) in downloaded_by_repo_path
+                and _expected_sha_repo_path(item["repo_path"])
+                in downloaded_by_repo_path
             }
 
             missing = [
                 item["repo_path"]
                 for item in sorted(data_items, key=lambda payload: payload["repo_path"])
-                if _expected_sha_repo_path(item["repo_path"]) not in downloaded_by_repo_path
+                if _expected_sha_repo_path(item["repo_path"])
+                not in downloaded_by_repo_path
             ]
             if missing:
                 print(
@@ -467,7 +585,7 @@ def _download_prepared_dataset(
             for future in as_completed(future_map):
                 repo_path = future_map[future]
                 try:
-                    target = future.result()
+                    target, sample_summary = future.result()
                 except Exception as exc:
                     print(
                         f"Failed to normalize prepared file '{repo_path}': {exc}",
@@ -476,12 +594,13 @@ def _download_prepared_dataset(
                     normalization_failed = True
                     continue
                 added.append(target)
+                sample_summaries.append(sample_summary)
 
         if normalization_failed:
             return None
 
         try:
-            metadata = _validate_and_collect_dataset_metadata(added)
+            metadata = _build_dataset_metadata(sample_summaries)
         except ValueError as exc:
             print(f"Validation failed: {exc}", file=sys.stderr)
             return None
@@ -492,7 +611,11 @@ def _download_prepared_dataset(
             if item.get("kind") != "data":
                 continue
             repo_path = str(item.get("repo_path", ""))
-            rel = repo_path[len("prepared/") :] if repo_path.startswith("prepared/") else ""
+            rel = (
+                repo_path[len("prepared/") :]
+                if repo_path.startswith("prepared/")
+                else ""
+            )
             parts = rel.split("/") if rel else []
             if len(parts) == 4:
                 platform, _dataset, shortname, _file_name = parts
@@ -531,6 +654,15 @@ def _download_prepared_dataset(
         ) as tar:
             for p in sorted(added, key=lambda x: x.name):
                 tar.add(p, arcname=p.name)
+        _write_import_manifest(
+            _import_manifest_path(data_path),
+            {
+                "dataset_name": dataset_name,
+                "transformation_cofactor": transformation_cofactor,
+                "source_checksums": source_checksums,
+                "metadata": metadata,
+            },
+        )
         print(f"Packaged {len(added)} CSV files into {data_path}")
         return added, metadata
 
@@ -603,7 +735,9 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     if args.transformation_cofactor is not None and args.transformation_cofactor <= 0:
-        raise ValueError("--transformation-cofactor must be greater than 0 when provided.")
+        raise ValueError(
+            "--transformation-cofactor must be greater than 0 when provided."
+        )
     if args.potential_batches is not None and args.potential_batches <= 0:
         raise ValueError("--potential-batches must be greater than 0 when provided.")
     outdir = args.output_dir
@@ -617,7 +751,9 @@ def main() -> None:
     )
     if downloaded is not None:
         csv_paths, metadata = downloaded
-        attachments_path = os.path.abspath(os.path.join(outdir, f"{args.name}.attachments.gz"))
+        attachments_path = os.path.abspath(
+            os.path.join(outdir, f"{args.name}.attachments.gz")
+        )
         with gzip.open(attachments_path, "wb") as lh:
             lh.write(b"")
         print(f"Wrote empty attachments file: {attachments_path}")
