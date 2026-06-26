@@ -185,7 +185,59 @@ def _ensure_trailing_newline(path: Path) -> None:
             fh.write(b"\n")
 
 
-def _list_prepared_files(dataset_name: str) -> list[dict]:
+def _list_local_prepared_files(dataset_name: str, prepared_root: str) -> list[dict]:
+    root = Path(prepared_root).resolve()
+    if not root.exists():
+        return []
+
+    target_dataset_l = dataset_name.strip().lower()
+    files = []
+    for path in sorted(root.glob("*/*/*/*")):
+        if not path.is_file():
+            continue
+
+        lower = path.name.lower()
+        is_data = lower.endswith(".csv.zst")
+        is_sha = lower.endswith(".csv.zst.sha256")
+        if not (is_data or is_sha):
+            continue
+
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        parts = rel.parts
+        if len(parts) != 4:
+            continue
+
+        platform_part, dataset_part, shortname_part, file_name = parts
+        if dataset_part.lower() != target_dataset_l:
+            continue
+
+        repo_path = "/".join(("prepared", *parts))
+        files.append(
+            {
+                "name": file_name,
+                "repo_path": repo_path,
+                "source_path": str(path),
+                "kind": "sha" if is_sha else "data",
+                "platform": platform_part,
+                "dataset": dataset_part,
+                "shortname": shortname_part,
+            }
+        )
+    return files
+
+
+def _list_prepared_files(
+    dataset_name: str, prepared_root: Optional[str] = None
+) -> list[dict]:
+    if prepared_root:
+        local_files = _list_local_prepared_files(dataset_name, prepared_root)
+        if local_files:
+            print(f"Resolved prepared files from local root: {prepared_root}")
+            return local_files
+
     repo_info = _extract_repo_info(BASE_URL)
     if not repo_info:
         raise ValueError("BASE_URL must be a GitHub raw URL to list prepared files.")
@@ -466,6 +518,18 @@ def _download_all(download_specs: list[tuple[dict, Path]]) -> bool:
     return not failed_download
 
 
+def _prepared_file_path(item: dict, tmpdir: str) -> Path:
+    source_path = item.get("source_path")
+    if isinstance(source_path, str) and source_path:
+        return Path(source_path)
+    return Path(tmpdir) / str(item["repo_path"])
+
+
+def _materialize_remote_prepared_files(file_specs: list[tuple[dict, Path]]) -> bool:
+    remote_specs = [spec for spec in file_specs if not spec[0].get("source_path")]
+    return _download_all(remote_specs)
+
+
 def _materialize_prepared_csv(
     base: str,
     zst_path: Path,
@@ -551,10 +615,13 @@ def _materialize_prepared_csv(
 
 
 def _download_prepared_dataset(
-    dataset_name: str, data_path: str, transformation_cofactor: Optional[float] = None
+    dataset_name: str,
+    data_path: str,
+    transformation_cofactor: Optional[float] = None,
+    prepared_root: Optional[str] = None,
 ) -> Optional[tuple[list[Path], dict]]:
     try:
-        prepared_files = _list_prepared_files(dataset_name)
+        prepared_files = _list_prepared_files(dataset_name, prepared_root)
     except Exception as exc:
         print(exc)
         return None
@@ -578,7 +645,7 @@ def _download_prepared_dataset(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         checksum_specs = [
-            (item, Path(tmpdir) / item["repo_path"])
+            (item, _prepared_file_path(item, tmpdir))
             for item in sorted(prepared_files, key=lambda payload: payload["repo_path"])
             if item.get("kind") == "sha"
         ]
@@ -588,7 +655,7 @@ def _download_prepared_dataset(
                 file=sys.stderr,
             )
             return None
-        if not _download_all(checksum_specs):
+        if not _materialize_remote_prepared_files(checksum_specs):
             return None
 
         source_checksums = {
@@ -604,10 +671,10 @@ def _download_prepared_dataset(
             return reused
 
         download_specs = [
-            (item, Path(tmpdir) / item["repo_path"])
+            (item, _prepared_file_path(item, tmpdir))
             for item in sorted(prepared_files, key=lambda payload: payload["repo_path"])
         ]
-        if not _download_all(download_specs):
+        if not _materialize_remote_prepared_files(download_specs):
             return None
 
         downloaded_by_repo_path = {
@@ -801,6 +868,15 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--prepared-root",
+        type=str,
+        default=None,
+        help=(
+            "Optional local prepared/ root. When set and matching files exist, "
+            "files are read locally instead of from the GitHub dataset repository."
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         required=True,
@@ -855,6 +931,7 @@ def main() -> None:
         args.dataset_name,
         data_path,
         transformation_cofactor=args.transformation_cofactor,
+        prepared_root=args.prepared_root,
     )
     if downloaded is not None:
         csv_paths, metadata = downloaded

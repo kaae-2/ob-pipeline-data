@@ -34,7 +34,7 @@ Validation rules at import time:
 - For a given `--dataset_name`, exactly one `shortname` (abbreviation) must be present.
 - Import fails fast if either condition is violated.
 
-For each selected dataset, the importer verifies checksums, decompresses `.csv.zst` to CSV, and packages CSVs into `{name}.data.tar.gz`.
+For each selected dataset, the importer verifies checksums, decompresses `.csv.zst` to CSV, and packages CSVs into `{name}.data.tar.gz`. The local runner checks this workspace's `datasets/prepared` folder first, then falls back to the remote dataset repository.
 
 The generated order metadata includes dataset-derived fields such as:
 
@@ -54,7 +54,7 @@ bash data/run_data_import.sh
 Or call the CLI directly:
 
 ```bash
-python data/data_import.py --dataset_name FR-FCM-Z3YR --name FR-FCM-Z3YR --seed 42 --potential-batches 3 --output_dir data/out/data/data_import
+python data/data_import.py --dataset_name FR-FCM-Z3YR --name FR-FCM-Z3YR --seed 42 --potential-batches 3 --prepared-root datasets/prepared --output_dir data/out/data/data_import
 ```
 
 ## Run as part of benchmark
@@ -69,6 +69,6 @@ just benchmark
 ## What `run_data_import.sh` needs
 
 - Python environment with dependencies from the module/benchmark env
-- Network access to the prepared dataset repository
+- Network access to the prepared dataset repository, unless matching local files exist under `datasets/prepared`
 - Writable output path under `data/out/...`
 - Enough disk for extracted/repacked archives
