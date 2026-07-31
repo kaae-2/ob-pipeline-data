@@ -42,6 +42,16 @@ DOWNLOAD_RETRIES = 3
 DOWNLOAD_RETRY_BASE_SECONDS = 1.0
 UNLABELED_VALUES = {"", "unlabeled", "ungated", "debris", "unknown", "other", "noise"}
 IMPORT_MANIFEST_SUFFIX = ".manifest.json"
+SPECTRAL_FLOW_15723074_COFACTORS = {
+    "CD14": 10000.0,
+    "CD19": 1000.0,
+    "CD3": 3000.0,
+    "CD56": 2000.0,
+    "CD45RA": 4000.0,
+    "CD8": 3000.0,
+    "CD4": 5000.0,
+    "CCR7": 6000.0,
+}
 
 
 def _copy_json_object(value):
@@ -461,6 +471,7 @@ def _reuse_packaged_dataset_if_valid(
     data_path: str,
     transformation_cofactor: Optional[float],
     source_checksums: dict[str, str],
+    feature_cofactors: Optional[dict[str, float]] = None,
 ) -> Optional[tuple[list[Path], dict]]:
     manifest_path = _import_manifest_path(data_path)
     manifest = _load_import_manifest(manifest_path)
@@ -477,6 +488,8 @@ def _reuse_packaged_dataset_if_valid(
     if manifest.get("dataset_name") != dataset_name:
         return None
     if manifest.get("transformation_cofactor") != transformation_cofactor:
+        return None
+    if manifest.get("feature_cofactors") != feature_cofactors:
         return None
     if manifest_checksums != source_checksums:
         return None
@@ -537,6 +550,7 @@ def _materialize_prepared_csv(
     tmpdir: str,
     zstd_module,
     transformation_cofactor: Optional[float] = None,
+    feature_cofactors: Optional[dict[str, float]] = None,
 ) -> tuple[Path, dict]:
     arcname = f"{base}.csv"
     target = Path(tmpdir) / arcname
@@ -559,6 +573,22 @@ def _materialize_prepared_csv(
                 wrote_any_chunk = True
                 columns = [str(col) for col in chunk.columns]
                 label_index = _find_label_index(columns)
+                if feature_cofactors is not None:
+                    missing_features = [
+                        feature for feature in feature_cofactors if feature not in columns
+                    ]
+                    if missing_features:
+                        raise ValueError(
+                            f"{arcname} is missing required publication markers: "
+                            + ", ".join(missing_features)
+                        )
+                    label_column = columns[label_index] if label_index is not None else None
+                    selected_columns = list(feature_cofactors)
+                    if label_column is not None:
+                        selected_columns.append(label_column)
+                    chunk = chunk.loc[:, selected_columns]
+                    columns = [str(col) for col in chunk.columns]
+                    label_index = _find_label_index(columns)
                 current_n_variables = (
                     len(columns) if label_index is None else len(columns) - 1
                 )
@@ -585,7 +615,20 @@ def _materialize_prepared_csv(
                         if value and value.lower() not in UNLABELED_VALUES
                     )
 
-                if transformation_cofactor is not None and feature_columns:
+                if feature_cofactors is not None:
+                    numeric_values = chunk.loc[:, feature_columns].apply(
+                        pd.to_numeric, errors="coerce"
+                    )
+                    cofactors = np.asarray(
+                        [feature_cofactors[column] for column in feature_columns]
+                    )
+                    transformed_values = np.arcsinh(
+                        numeric_values.to_numpy(dtype=np.float64, copy=False)
+                        / cofactors
+                    )
+                    for column_index, column in enumerate(feature_columns):
+                        chunk[column] = transformed_values[:, column_index]
+                elif transformation_cofactor is not None and feature_columns:
                     numeric_values = chunk.loc[:, feature_columns].apply(
                         pd.to_numeric, errors="coerce"
                     )
@@ -620,6 +663,9 @@ def _download_prepared_dataset(
     transformation_cofactor: Optional[float] = None,
     prepared_root: Optional[str] = None,
 ) -> Optional[tuple[list[Path], dict]]:
+    feature_cofactors = (
+        SPECTRAL_FLOW_15723074_COFACTORS if dataset_name == "15723074" else None
+    )
     try:
         prepared_files = _list_prepared_files(dataset_name, prepared_root)
     except Exception as exc:
@@ -666,6 +712,7 @@ def _download_prepared_dataset(
             data_path,
             transformation_cofactor,
             source_checksums,
+            feature_cofactors,
         )
         if reused is not None:
             return reused
@@ -702,6 +749,7 @@ def _download_prepared_dataset(
                     tmpdir,
                     zstd,
                     transformation_cofactor,
+                    feature_cofactors,
                 ): item["repo_path"]
                 for item in sorted(data_items, key=lambda payload: payload["repo_path"])
                 if item["repo_path"] in downloaded_by_repo_path
@@ -772,6 +820,9 @@ def _download_prepared_dataset(
         dataset_metadata["platform"] = next(iter(platforms))
         dataset_metadata["platforms"] = sorted(platforms)
         dataset_metadata["transformation_cofactor"] = transformation_cofactor
+        if feature_cofactors is not None:
+            dataset_metadata["selected_features"] = list(feature_cofactors)
+            dataset_metadata["feature_cofactors"] = feature_cofactors
 
         if shortnames:
             dataset_metadata["shortnames"] = sorted(shortnames)
@@ -799,6 +850,7 @@ def _download_prepared_dataset(
             {
                 "dataset_name": dataset_name,
                 "transformation_cofactor": transformation_cofactor,
+                "feature_cofactors": feature_cofactors,
                 "source_checksums": source_checksums,
                 "metadata_payload": {
                     "schema_version": 1,
