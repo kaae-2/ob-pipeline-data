@@ -26,15 +26,24 @@ where:
 The importer currently expects:
 
 - data files: `*.csv.zst`
+- or contiguous zero-based split objects: `*.csv.zst.partNNNN`
 - checksum files: `*.csv.zst.sha256`
 
 Validation rules at import time:
 
 - For a given `--dataset_name`, exactly one `platform` must be present.
 - For a given `--dataset_name`, exactly one `shortname` (abbreviation) must be present.
+- Every checksum has exactly one whole or complete split representation; neither,
+  both, gaps, duplicate part numbers, and orphan objects fail closed.
+- `--dataset-revision` is required and must be a full lowercase 40-character
+  commit SHA. GitHub tree/API/raw requests use only that revision.
 - Import fails fast if either condition is violated.
 
-For each selected dataset, the importer verifies checksums, decompresses `.csv.zst` to CSV, and packages CSVs into `{name}.data.tar.gz`. The local runner checks this workspace's `datasets/prepared` folder first, then falls back to the remote dataset repository.
+For each selected dataset, the importer verifies checksums, decompresses `.csv.zst` to CSV, and packages CSVs into `{name}.data.tar.gz`. Split parts are ordered and streamed into a temporary whole object, verified against the existing whole-file checksum, and removed automatically after import. A local `--prepared-root` is accepted only from a clean Git checkout whose `HEAD` equals `--dataset-revision`; ordinary benchmark clones use the immutable remote and do not depend on a root datasets submodule.
+
+Import metadata and the cache sidecar record the dataset revision and the
+dataset-scoped identity from the published prepared-data manifest contract.
+Changing either invalidates cache reuse.
 
 The generated order metadata includes dataset-derived fields such as:
 
@@ -54,7 +63,7 @@ bash data/run_data_import.sh
 Or call the CLI directly:
 
 ```bash
-python data/data_import.py --dataset_name FR-FCM-Z3YR --name FR-FCM-Z3YR --seed 42 --potential-batches 3 --prepared-root datasets/prepared --output_dir data/out/data/data_import
+python data/data_import.py --dataset_name FR-FCM-Z3YR --dataset-revision <full-commit> --name FR-FCM-Z3YR --seed 42 --potential-batches 3 --prepared-root datasets/prepared --output_dir data/out/data/data_import
 ```
 
 ## Run as part of benchmark

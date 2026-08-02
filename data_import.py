@@ -6,12 +6,13 @@ import io
 import json
 import os
 import random
+import re
+import subprocess
 import sys
 import tarfile
 import tempfile
 import time
 import urllib.error
-import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -20,8 +21,10 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-# Base URL for raw downloads (GitHub raw endpoint via github.com)
-BASE_URL = "https://github.com/kaae-2/ob-flow-datasets/raw/main"
+DATASET_REPOSITORY_URL = "https://github.com/kaae-2/ob-flow-datasets"
+DATASET_MANIFEST_PATH = "scripts/prepared_data_manifest.py"
+FULL_COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+PART_RE = re.compile(r"^(?P<whole>.+\.csv\.zst)\.part(?P<number>[0-9]+)$")
 
 LABEL_COLUMN_CANDIDATES = (
     "label",
@@ -171,13 +174,13 @@ def download_file(
     return False
 
 
-def _extract_repo_info(base_url: str):
-    parsed = urllib.parse.urlparse(base_url)
-    parts = parsed.path.strip("/").split("/")
-    if parsed.netloc == "github.com" and len(parts) >= 4 and parts[2] == "raw":
-        owner, repo, _, branch = parts[:4]
-        return {"owner": owner, "repo": repo, "branch": branch}
-    return None
+def _require_dataset_revision(dataset_revision: str) -> str:
+    revision = dataset_revision.strip()
+    if not FULL_COMMIT_RE.fullmatch(revision):
+        raise ValueError(
+            "dataset revision must be a full 40-character lowercase Git commit SHA"
+        )
+    return revision
 
 
 def _ensure_trailing_newline(path: Path) -> None:
@@ -195,69 +198,105 @@ def _ensure_trailing_newline(path: Path) -> None:
             fh.write(b"\n")
 
 
-def _list_local_prepared_files(dataset_name: str, prepared_root: str) -> list[dict]:
+def _prepared_kind(file_name: str) -> Optional[str]:
+    lower = file_name.lower()
+    if lower.endswith(".csv.zst.sha256"):
+        return "sha"
+    if PART_RE.fullmatch(file_name):
+        return "part"
+    if lower.endswith(".csv.zst"):
+        return "data"
+    return None
+
+
+def _list_local_prepared_files(
+    dataset_name: str, prepared_root: str, dataset_revision: str
+) -> list[dict]:
     root = Path(prepared_root).resolve()
     if not root.exists():
         return []
 
+    repository = root.parent
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        dirty = subprocess.run(
+            ["git", "status", "--porcelain", "--untracked-files=all", "--", "prepared"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError(
+            "--prepared-root must be the prepared directory of a Git checkout"
+        ) from exc
+    if head != dataset_revision:
+        raise ValueError(
+            f"local prepared root is at {head}, expected {dataset_revision}"
+        )
+    if dirty:
+        raise ValueError("local prepared root has changes outside the pinned Git tree")
+
+    tree = subprocess.run(
+        ["git", "ls-tree", "-r", "-l", dataset_revision, "--", "prepared"],
+        cwd=repository,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.splitlines()
+
     target_dataset_l = dataset_name.strip().lower()
     files = []
-    for path in sorted(root.glob("*/*/*/*")):
-        if not path.is_file():
+    for record in tree:
+        metadata, repo_path = record.split("\t", 1)
+        _mode, object_type, blob_sha, raw_size = metadata.split()
+        if object_type != "blob" or not repo_path.startswith("prepared/"):
             continue
-
-        lower = path.name.lower()
-        is_data = lower.endswith(".csv.zst")
-        is_sha = lower.endswith(".csv.zst.sha256")
-        if not (is_data or is_sha):
+        rel = Path(repo_path).relative_to("prepared")
+        if len(rel.parts) != 4:
             continue
-
-        try:
-            rel = path.relative_to(root)
-        except ValueError:
+        platform_part, dataset_part, shortname_part, file_name = rel.parts
+        kind = _prepared_kind(file_name)
+        if kind is None or dataset_part.lower() != target_dataset_l:
             continue
-        parts = rel.parts
-        if len(parts) != 4:
-            continue
-
-        platform_part, dataset_part, shortname_part, file_name = parts
-        if dataset_part.lower() != target_dataset_l:
-            continue
-
-        repo_path = "/".join(("prepared", *parts))
         files.append(
             {
                 "name": file_name,
                 "repo_path": repo_path,
-                "source_path": str(path),
-                "kind": "sha" if is_sha else "data",
+                "source_path": str(repository / repo_path),
+                "kind": kind,
                 "platform": platform_part,
                 "dataset": dataset_part,
                 "shortname": shortname_part,
+                "size": int(raw_size),
+                "blob_sha": blob_sha,
             }
         )
     return files
 
 
 def _list_prepared_files(
-    dataset_name: str, prepared_root: Optional[str] = None
+    dataset_name: str,
+    dataset_revision: str,
+    prepared_root: Optional[str] = None,
 ) -> list[dict]:
+    revision = _require_dataset_revision(dataset_revision)
     if prepared_root:
-        local_files = _list_local_prepared_files(dataset_name, prepared_root)
+        local_files = _list_local_prepared_files(dataset_name, prepared_root, revision)
         if local_files:
             print(f"Resolved prepared files from local root: {prepared_root}")
             return local_files
 
-    repo_info = _extract_repo_info(BASE_URL)
-    if not repo_info:
-        raise ValueError("BASE_URL must be a GitHub raw URL to list prepared files.")
-
     target_dataset = dataset_name.strip()
-
     tree_url = (
-        "https://api.github.com/repos/"
-        f"{repo_info['owner']}/{repo_info['repo']}/git/trees/{repo_info['branch']}"
-        "?recursive=1"
+        "https://api.github.com/repos/kaae-2/ob-flow-datasets/git/trees/"
+        f"{revision}?recursive=1"
     )
 
     try:
@@ -277,6 +316,8 @@ def _list_prepared_files(
     tree = payload.get("tree") if isinstance(payload, dict) else None
     if not isinstance(tree, list):
         return []
+    if payload.get("truncated"):
+        raise RuntimeError("GitHub returned a truncated prepared-data tree.")
 
     files = []
     target_dataset_l = target_dataset.lower()
@@ -297,24 +338,115 @@ def _list_prepared_files(
         if dataset_part.lower() != target_dataset_l:
             continue
 
-        lower = file_name.lower()
-        is_data = lower.endswith(".csv.zst")
-        is_sha = lower.endswith(".csv.zst.sha256")
-        if not (is_data or is_sha):
+        kind = _prepared_kind(file_name)
+        if kind is None:
             continue
 
         files.append(
             {
                 "name": file_name,
                 "repo_path": repo_path,
-                "url": f"{BASE_URL}/{repo_path}",
-                "kind": "sha" if is_sha else "data",
+                "url": f"{DATASET_REPOSITORY_URL}/raw/{revision}/{repo_path}",
+                "kind": kind,
                 "platform": platform_part,
                 "dataset": dataset_part,
                 "shortname": shortname_part,
+                "size": int(item.get("size", 0)),
+                "blob_sha": str(item.get("sha", "")),
             }
         )
     return files
+
+
+def _resolve_prepared_samples(prepared_files: list[dict]) -> list[dict]:
+    checksums: dict[str, dict] = {}
+    wholes: dict[str, dict] = {}
+    parts: dict[str, list[tuple[int, dict]]] = {}
+    for item in prepared_files:
+        repo_path = str(item["repo_path"])
+        kind = item.get("kind")
+        if kind == "sha":
+            checksums[repo_path[: -len(".sha256")]] = item
+        elif kind == "data":
+            wholes[repo_path] = item
+        elif kind == "part":
+            match = PART_RE.fullmatch(repo_path)
+            if match is None:
+                raise ValueError(f"Invalid split-part name: {repo_path}")
+            parts.setdefault(match.group("whole"), []).append(
+                (int(match.group("number")), item)
+            )
+
+    samples = []
+    for repo_path in sorted(set(checksums) | set(wholes) | set(parts)):
+        checksum = checksums.get(repo_path)
+        whole = wholes.get(repo_path)
+        numbered_parts = parts.get(repo_path, [])
+        if checksum is None:
+            raise ValueError(f"orphan data object without checksum: {repo_path}")
+        if whole is not None and numbered_parts:
+            raise ValueError(f"ambiguous whole and split representations: {repo_path}")
+        if whole is None and not numbered_parts:
+            raise ValueError(f"checksum has no data representation: {checksum['repo_path']}")
+
+        if whole is not None:
+            representation = "whole"
+            source_objects = [whole]
+        else:
+            ordered = sorted(numbered_parts, key=lambda pair: (pair[0], pair[1]["repo_path"]))
+            numbers = [number for number, _item in ordered]
+            if len(numbers) != len(set(numbers)):
+                raise ValueError(f"duplicate split-part number: {repo_path}")
+            expected = list(range(len(numbers)))
+            if numbers != expected:
+                raise ValueError(
+                    f"noncontiguous split parts for {repo_path}: expected {expected}, got {numbers}"
+                )
+            representation = "split"
+            source_objects = [item for _number, item in ordered]
+
+        prototype = whole or source_objects[0]
+        samples.append(
+            {
+                **prototype,
+                "name": Path(repo_path).name,
+                "repo_path": repo_path,
+                "kind": "data",
+                "representation": representation,
+                "source_objects": source_objects,
+                "checksum": checksum,
+            }
+        )
+    return samples
+
+
+def _source_manifest(
+    dataset_name: str, dataset_revision: str, prepared_files: list[dict]
+) -> dict:
+    facts = [
+        {
+            "path": item["repo_path"],
+            "size": int(item.get("size", 0)),
+            "blob_sha": str(item.get("blob_sha", "")),
+        }
+        for item in sorted(prepared_files, key=lambda payload: payload["repo_path"])
+    ]
+    encoded = json.dumps(
+        facts, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode()
+    return {
+        "schema_version": "1.0.0",
+        "dataset": dataset_name,
+        "dataset_revision": dataset_revision,
+        "generator": (
+            f"{DATASET_REPOSITORY_URL}/blob/{dataset_revision}/{DATASET_MANIFEST_PATH}"
+        ),
+        "identity": {
+            "algorithm": "sha256",
+            "scope": "dataset-prepared-tree-path-size-git-blob-sha",
+            "value": hashlib.sha256(encoded).hexdigest(),
+        },
+    }
 
 
 def _derive_expected_abbreviations(prepared_files: list[dict]) -> list[str]:
@@ -350,6 +482,34 @@ def _verify_sha256(path: Path, sha_path: Path) -> None:
     actual = _file_sha256(path)
     if actual != expected:
         raise ValueError(f"SHA256 mismatch (expected {expected}, got {actual}).")
+
+
+def _assemble_split_parts(
+    part_paths: list[Path], target: Path, sha_path: Path
+) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    partial = target.with_name(f"{target.name}.partial")
+    partial.unlink(missing_ok=True)
+    target.unlink(missing_ok=True)
+    digest = hashlib.sha256()
+    try:
+        with partial.open("wb") as output:
+            for part_path in part_paths:
+                with part_path.open("rb") as source:
+                    while chunk := source.read(DOWNLOAD_CHUNK_SIZE):
+                        output.write(chunk)
+                        digest.update(chunk)
+        expected = _read_sha256(sha_path)
+        actual = digest.hexdigest()
+        if actual != expected:
+            raise ValueError(
+                f"SHA256 mismatch (expected {expected}, got {actual})."
+            )
+        partial.replace(target)
+    except Exception:
+        partial.unlink(missing_ok=True)
+        target.unlink(missing_ok=True)
+        raise
 
 
 def _find_label_index(header: list[str]) -> Optional[int]:
@@ -472,6 +632,8 @@ def _reuse_packaged_dataset_if_valid(
     transformation_cofactor: Optional[float],
     source_checksums: dict[str, str],
     feature_cofactors: Optional[dict[str, float]] = None,
+    dataset_revision: Optional[str] = None,
+    source_manifest: Optional[dict] = None,
 ) -> Optional[tuple[list[Path], dict]]:
     manifest_path = _import_manifest_path(data_path)
     manifest = _load_import_manifest(manifest_path)
@@ -490,6 +652,10 @@ def _reuse_packaged_dataset_if_valid(
     if manifest.get("transformation_cofactor") != transformation_cofactor:
         return None
     if manifest.get("feature_cofactors") != feature_cofactors:
+        return None
+    if manifest.get("dataset_revision") != dataset_revision:
+        return None
+    if manifest.get("source_manifest") != source_manifest:
         return None
     if manifest_checksums != source_checksums:
         return None
@@ -660,23 +826,32 @@ def _materialize_prepared_csv(
 def _download_prepared_dataset(
     dataset_name: str,
     data_path: str,
+    dataset_revision: str,
     transformation_cofactor: Optional[float] = None,
     prepared_root: Optional[str] = None,
 ) -> Optional[tuple[list[Path], dict]]:
+    try:
+        revision = _require_dataset_revision(dataset_revision)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return None
     feature_cofactors = (
         SPECTRAL_FLOW_15723074_COFACTORS if dataset_name == "15723074" else None
     )
     try:
-        prepared_files = _list_prepared_files(dataset_name, prepared_root)
+        prepared_files = _list_prepared_files(dataset_name, revision, prepared_root)
+        prepared_samples = _resolve_prepared_samples(prepared_files)
     except Exception as exc:
-        print(exc)
+        print(exc, file=sys.stderr)
         return None
 
-    if not prepared_files:
+    if not prepared_samples:
         print(
             f"No prepared CSV files found in the source repository for '{dataset_name}'."
         )
         return None
+
+    source_manifest = _source_manifest(dataset_name, revision, prepared_files)
 
     os.makedirs(os.path.dirname(data_path), exist_ok=True)
     added = []
@@ -691,9 +866,8 @@ def _download_prepared_dataset(
 
     with tempfile.TemporaryDirectory() as tmpdir:
         checksum_specs = [
-            (item, _prepared_file_path(item, tmpdir))
-            for item in sorted(prepared_files, key=lambda payload: payload["repo_path"])
-            if item.get("kind") == "sha"
+            (sample["checksum"], _prepared_file_path(sample["checksum"], tmpdir))
+            for sample in prepared_samples
         ]
         if not checksum_specs:
             print(
@@ -713,30 +887,50 @@ def _download_prepared_dataset(
             transformation_cofactor,
             source_checksums,
             feature_cofactors,
+            revision,
+            source_manifest,
         )
         if reused is not None:
             return reused
 
-        download_specs = [
+        source_items = {
+            item["repo_path"]: item
+            for sample in prepared_samples
+            for item in sample["source_objects"]
+        }
+        source_specs = [
             (item, _prepared_file_path(item, tmpdir))
-            for item in sorted(prepared_files, key=lambda payload: payload["repo_path"])
+            for item in sorted(source_items.values(), key=lambda payload: payload["repo_path"])
         ]
-        if not _materialize_remote_prepared_files(download_specs):
+        if not _materialize_remote_prepared_files(source_specs):
             return None
 
         downloaded_by_repo_path = {
-            item["repo_path"]: dest for item, dest in download_specs
+            item["repo_path"]: dest for item, dest in [*checksum_specs, *source_specs]
         }
-
-        data_items = [item for item in prepared_files if item.get("kind") == "data"]
-        if not data_items:
-            print(
-                f"No data files were resolved for prepared dataset '{dataset_name}'.",
-                file=sys.stderr,
-            )
+        materialized_wholes: dict[str, Path] = {}
+        try:
+            for sample in prepared_samples:
+                if sample["representation"] == "whole":
+                    materialized_wholes[sample["repo_path"]] = downloaded_by_repo_path[
+                        sample["repo_path"]
+                    ]
+                    continue
+                target = Path(tmpdir) / "assembled" / sample["repo_path"]
+                _assemble_split_parts(
+                    [
+                        downloaded_by_repo_path[item["repo_path"]]
+                        for item in sample["source_objects"]
+                    ],
+                    target,
+                    downloaded_by_repo_path[sample["checksum"]["repo_path"]],
+                )
+                materialized_wholes[sample["repo_path"]] = target
+        except Exception as exc:
+            print(f"Failed to assemble prepared split file: {exc}", file=sys.stderr)
             return None
 
-        normalize_workers = min(NORMALIZE_MAX_WORKERS, len(data_items))
+        normalize_workers = min(NORMALIZE_MAX_WORKERS, len(prepared_samples))
         normalization_failed = False
         sample_summaries: list[dict] = []
         with ThreadPoolExecutor(max_workers=normalize_workers) as executor:
@@ -744,31 +938,15 @@ def _download_prepared_dataset(
                 executor.submit(
                     _materialize_prepared_csv,
                     Path(item["repo_path"]).name[: -len(".csv.zst")],
-                    downloaded_by_repo_path[item["repo_path"]],
-                    downloaded_by_repo_path[_expected_sha_repo_path(item["repo_path"])],
+                    materialized_wholes[item["repo_path"]],
+                    downloaded_by_repo_path[item["checksum"]["repo_path"]],
                     tmpdir,
                     zstd,
                     transformation_cofactor,
                     feature_cofactors,
                 ): item["repo_path"]
-                for item in sorted(data_items, key=lambda payload: payload["repo_path"])
-                if item["repo_path"] in downloaded_by_repo_path
-                and _expected_sha_repo_path(item["repo_path"])
-                in downloaded_by_repo_path
+                for item in prepared_samples
             }
-
-            missing = [
-                item["repo_path"]
-                for item in sorted(data_items, key=lambda payload: payload["repo_path"])
-                if _expected_sha_repo_path(item["repo_path"])
-                not in downloaded_by_repo_path
-            ]
-            if missing:
-                print(
-                    "Missing checksum files for prepared inputs: " + ", ".join(missing),
-                    file=sys.stderr,
-                )
-                return None
 
             for future in as_completed(future_map):
                 repo_path = future_map[future]
@@ -795,9 +973,7 @@ def _download_prepared_dataset(
 
         platforms: set[str] = set()
         shortnames: set[str] = set()
-        for item in prepared_files:
-            if item.get("kind") != "data":
-                continue
+        for item in prepared_samples:
             repo_path = str(item.get("repo_path", ""))
             rel = (
                 repo_path[len("prepared/") :]
@@ -827,7 +1003,7 @@ def _download_prepared_dataset(
         if shortnames:
             dataset_metadata["shortnames"] = sorted(shortnames)
 
-        abbreviations = _derive_expected_abbreviations(prepared_files)
+        abbreviations = _derive_expected_abbreviations(prepared_samples)
         if len(abbreviations) != 1:
             print(
                 "Invalid dataset layout: expected exactly one shortname/abbreviation "
@@ -837,6 +1013,8 @@ def _download_prepared_dataset(
             return None
         dataset_metadata["expected_abbreviation"] = abbreviations[0]
         dataset_metadata["expected_abbreviations"] = abbreviations
+        dataset_metadata["dataset_revision"] = revision
+        dataset_metadata["source_manifest"] = source_manifest
 
         with tarfile.open(
             data_path,
@@ -849,6 +1027,8 @@ def _download_prepared_dataset(
             _import_manifest_path(data_path),
             {
                 "dataset_name": dataset_name,
+                "dataset_revision": revision,
+                "source_manifest": source_manifest,
                 "transformation_cofactor": transformation_cofactor,
                 "feature_cofactors": feature_cofactors,
                 "source_checksums": source_checksums,
@@ -920,6 +1100,12 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--dataset-revision",
+        type=str,
+        required=True,
+        help="Full immutable 40-character commit SHA of the prepared dataset repository.",
+    )
+    parser.add_argument(
         "--prepared-root",
         type=str,
         default=None,
@@ -969,6 +1155,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    _require_dataset_revision(args.dataset_revision)
     if args.transformation_cofactor is not None and args.transformation_cofactor <= 0:
         raise ValueError(
             "--transformation-cofactor must be greater than 0 when provided."
@@ -982,6 +1169,7 @@ def main() -> None:
     downloaded = _download_prepared_dataset(
         args.dataset_name,
         data_path,
+        args.dataset_revision,
         transformation_cofactor=args.transformation_cofactor,
         prepared_root=args.prepared_root,
     )

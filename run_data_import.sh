@@ -6,6 +6,7 @@ script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_dir="$(cd -- "${script_dir}/.." && pwd)"
 
 DATASET_NAME="${1:-FR-FCM-Z3YR}"
+DATASET_REVISION="${DATASET_REVISION:?Set DATASET_REVISION to the full prepared-dataset commit SHA}"
 if [[ $# -gt 0 ]]; then
   shift
 fi
@@ -13,6 +14,7 @@ fi
 # Use the dataset name as the output 'name' so produced tarball is `<name>.data.tar.gz`.
 python "${script_dir}/data_import.py" \
   --dataset_name "${DATASET_NAME}" \
+  --dataset-revision "${DATASET_REVISION}" \
   --name "${DATASET_NAME}" \
   --seed "42" \
   --prepared-root "${repo_dir}/datasets/prepared" \

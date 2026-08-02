@@ -1,6 +1,7 @@
 import hashlib
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -16,6 +17,21 @@ SPEC = importlib.util.spec_from_file_location('data_import', MODULE_PATH)
 data_import = importlib.util.module_from_spec(SPEC)
 assert SPEC.loader is not None
 SPEC.loader.exec_module(data_import)
+
+
+def commit_prepared_tree(root: Path) -> str:
+    subprocess.run(['git', 'init', '-q'], cwd=root, check=True)
+    subprocess.run(['git', 'config', 'user.name', 'Test'], cwd=root, check=True)
+    subprocess.run(['git', 'config', 'user.email', 'test@example.invalid'], cwd=root, check=True)
+    subprocess.run(['git', 'add', 'prepared'], cwd=root, check=True)
+    subprocess.run(['git', 'commit', '-q', '-m', 'fixture'], cwd=root, check=True)
+    return subprocess.run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=root,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
 
 
 class SpectralFlowTransformTests(unittest.TestCase):
@@ -82,11 +98,13 @@ class SpectralFlowTransformTests(unittest.TestCase):
             checksum.write_text(
                 f'{hashlib.sha256(compressed).hexdigest()}  {archive.name}\n'
             )
+            revision = commit_prepared_tree(root)
             data_path = root / 'output' / 'dataset.data.tar.gz'
 
             downloaded = data_import._download_prepared_dataset(
                 '15723074',
                 str(data_path),
+                revision,
                 prepared_root=str(root / 'prepared'),
             )
 
@@ -104,6 +122,11 @@ class SpectralFlowTransformTests(unittest.TestCase):
             )
             manifest_path = data_import._import_manifest_path(str(data_path))
             manifest = json.loads(manifest_path.read_text())
+            self.assertEqual(manifest['dataset_revision'], revision)
+            self.assertEqual(
+                manifest['source_manifest'], metadata['dataset']['source_manifest']
+            )
+            self.assertEqual(metadata['dataset']['dataset_revision'], revision)
             self.assertEqual(
                 manifest['feature_cofactors'],
                 data_import.SPECTRAL_FLOW_15723074_COFACTORS,
@@ -117,6 +140,7 @@ class SpectralFlowTransformTests(unittest.TestCase):
                 reused = data_import._download_prepared_dataset(
                     '15723074',
                     str(data_path),
+                    revision,
                     prepared_root=str(root / 'prepared'),
                 )
             self.assertIsNotNone(reused)
