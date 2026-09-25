@@ -45,16 +45,6 @@ DOWNLOAD_RETRIES = 3
 DOWNLOAD_RETRY_BASE_SECONDS = 1.0
 UNLABELED_VALUES = {"", "unlabeled", "ungated", "debris", "unknown", "other", "noise"}
 IMPORT_MANIFEST_SUFFIX = ".manifest.json"
-SPECTRAL_FLOW_15723074_COFACTORS = {
-    "CD14": 10000.0,
-    "CD19": 1000.0,
-    "CD3": 3000.0,
-    "CD56": 2000.0,
-    "CD45RA": 4000.0,
-    "CD8": 3000.0,
-    "CD4": 5000.0,
-    "CCR7": 6000.0,
-}
 
 
 def _copy_json_object(value):
@@ -387,13 +377,17 @@ def _resolve_prepared_samples(prepared_files: list[dict]) -> list[dict]:
         if whole is not None and numbered_parts:
             raise ValueError(f"ambiguous whole and split representations: {repo_path}")
         if whole is None and not numbered_parts:
-            raise ValueError(f"checksum has no data representation: {checksum['repo_path']}")
+            raise ValueError(
+                f"checksum has no data representation: {checksum['repo_path']}"
+            )
 
         if whole is not None:
             representation = "whole"
             source_objects = [whole]
         else:
-            ordered = sorted(numbered_parts, key=lambda pair: (pair[0], pair[1]["repo_path"]))
+            ordered = sorted(
+                numbered_parts, key=lambda pair: (pair[0], pair[1]["repo_path"])
+            )
             numbers = [number for number, _item in ordered]
             if len(numbers) != len(set(numbers)):
                 raise ValueError(f"duplicate split-part number: {repo_path}")
@@ -484,9 +478,7 @@ def _verify_sha256(path: Path, sha_path: Path) -> None:
         raise ValueError(f"SHA256 mismatch (expected {expected}, got {actual}).")
 
 
-def _assemble_split_parts(
-    part_paths: list[Path], target: Path, sha_path: Path
-) -> None:
+def _assemble_split_parts(part_paths: list[Path], target: Path, sha_path: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(f"{target.name}.partial")
     partial.unlink(missing_ok=True)
@@ -502,9 +494,7 @@ def _assemble_split_parts(
         expected = _read_sha256(sha_path)
         actual = digest.hexdigest()
         if actual != expected:
-            raise ValueError(
-                f"SHA256 mismatch (expected {expected}, got {actual})."
-            )
+            raise ValueError(f"SHA256 mismatch (expected {expected}, got {actual}).")
         partial.replace(target)
     except Exception:
         partial.unlink(missing_ok=True)
@@ -631,7 +621,6 @@ def _reuse_packaged_dataset_if_valid(
     data_path: str,
     transformation_cofactor: Optional[float],
     source_checksums: dict[str, str],
-    feature_cofactors: Optional[dict[str, float]] = None,
     dataset_revision: Optional[str] = None,
     source_manifest: Optional[dict] = None,
 ) -> Optional[tuple[list[Path], dict]]:
@@ -642,16 +631,13 @@ def _reuse_packaged_dataset_if_valid(
 
     manifest_checksums = manifest.get("source_checksums")
     metadata_payload = manifest.get("metadata_payload")
-    if (
-        not isinstance(manifest_checksums, dict)
-        or not isinstance(metadata_payload, dict)
+    if not isinstance(manifest_checksums, dict) or not isinstance(
+        metadata_payload, dict
     ):
         return None
     if manifest.get("dataset_name") != dataset_name:
         return None
     if manifest.get("transformation_cofactor") != transformation_cofactor:
-        return None
-    if manifest.get("feature_cofactors") != feature_cofactors:
         return None
     if manifest.get("dataset_revision") != dataset_revision:
         return None
@@ -716,7 +702,6 @@ def _materialize_prepared_csv(
     tmpdir: str,
     zstd_module,
     transformation_cofactor: Optional[float] = None,
-    feature_cofactors: Optional[dict[str, float]] = None,
 ) -> tuple[Path, dict]:
     arcname = f"{base}.csv"
     target = Path(tmpdir) / arcname
@@ -739,22 +724,6 @@ def _materialize_prepared_csv(
                 wrote_any_chunk = True
                 columns = [str(col) for col in chunk.columns]
                 label_index = _find_label_index(columns)
-                if feature_cofactors is not None:
-                    missing_features = [
-                        feature for feature in feature_cofactors if feature not in columns
-                    ]
-                    if missing_features:
-                        raise ValueError(
-                            f"{arcname} is missing required publication markers: "
-                            + ", ".join(missing_features)
-                        )
-                    label_column = columns[label_index] if label_index is not None else None
-                    selected_columns = list(feature_cofactors)
-                    if label_column is not None:
-                        selected_columns.append(label_column)
-                    chunk = chunk.loc[:, selected_columns]
-                    columns = [str(col) for col in chunk.columns]
-                    label_index = _find_label_index(columns)
                 current_n_variables = (
                     len(columns) if label_index is None else len(columns) - 1
                 )
@@ -781,20 +750,7 @@ def _materialize_prepared_csv(
                         if value and value.lower() not in UNLABELED_VALUES
                     )
 
-                if feature_cofactors is not None:
-                    numeric_values = chunk.loc[:, feature_columns].apply(
-                        pd.to_numeric, errors="coerce"
-                    )
-                    cofactors = np.asarray(
-                        [feature_cofactors[column] for column in feature_columns]
-                    )
-                    transformed_values = np.arcsinh(
-                        numeric_values.to_numpy(dtype=np.float64, copy=False)
-                        / cofactors
-                    )
-                    for column_index, column in enumerate(feature_columns):
-                        chunk[column] = transformed_values[:, column_index]
-                elif transformation_cofactor is not None and feature_columns:
+                if transformation_cofactor is not None and feature_columns:
                     numeric_values = chunk.loc[:, feature_columns].apply(
                         pd.to_numeric, errors="coerce"
                     )
@@ -802,7 +758,8 @@ def _materialize_prepared_csv(
                         numeric_values.to_numpy(dtype=np.float64, copy=False)
                         / transformation_cofactor
                     )
-                    chunk.loc[:, feature_columns] = transformed_values
+                    for column_index, column in enumerate(feature_columns):
+                        chunk[column] = transformed_values[:, column_index]
 
                 cell_count += len(chunk)
                 chunk.to_csv(
@@ -827,7 +784,7 @@ def _download_prepared_dataset(
     dataset_name: str,
     data_path: str,
     dataset_revision: str,
-    transformation_cofactor: Optional[float] = None,
+    transformation_cofactor: Optional[float] = 150.0,
     prepared_root: Optional[str] = None,
 ) -> Optional[tuple[list[Path], dict]]:
     try:
@@ -835,9 +792,6 @@ def _download_prepared_dataset(
     except ValueError as exc:
         print(exc, file=sys.stderr)
         return None
-    feature_cofactors = (
-        SPECTRAL_FLOW_15723074_COFACTORS if dataset_name == "15723074" else None
-    )
     try:
         prepared_files = _list_prepared_files(dataset_name, revision, prepared_root)
         prepared_samples = _resolve_prepared_samples(prepared_files)
@@ -886,7 +840,6 @@ def _download_prepared_dataset(
             data_path,
             transformation_cofactor,
             source_checksums,
-            feature_cofactors,
             revision,
             source_manifest,
         )
@@ -900,7 +853,9 @@ def _download_prepared_dataset(
         }
         source_specs = [
             (item, _prepared_file_path(item, tmpdir))
-            for item in sorted(source_items.values(), key=lambda payload: payload["repo_path"])
+            for item in sorted(
+                source_items.values(), key=lambda payload: payload["repo_path"]
+            )
         ]
         if not _materialize_remote_prepared_files(source_specs):
             return None
@@ -943,7 +898,6 @@ def _download_prepared_dataset(
                     tmpdir,
                     zstd,
                     transformation_cofactor,
-                    feature_cofactors,
                 ): item["repo_path"]
                 for item in prepared_samples
             }
@@ -996,9 +950,6 @@ def _download_prepared_dataset(
         dataset_metadata["platform"] = next(iter(platforms))
         dataset_metadata["platforms"] = sorted(platforms)
         dataset_metadata["transformation_cofactor"] = transformation_cofactor
-        if feature_cofactors is not None:
-            dataset_metadata["selected_features"] = list(feature_cofactors)
-            dataset_metadata["feature_cofactors"] = feature_cofactors
 
         if shortnames:
             dataset_metadata["shortnames"] = sorted(shortnames)
@@ -1030,7 +981,6 @@ def _download_prepared_dataset(
                 "dataset_revision": revision,
                 "source_manifest": source_manifest,
                 "transformation_cofactor": transformation_cofactor,
-                "feature_cofactors": feature_cofactors,
                 "source_checksums": source_checksums,
                 "metadata_payload": {
                     "schema_version": 1,
@@ -1065,7 +1015,9 @@ def _download_prepared_dataset(
                     "cells_per_sample": _copy_json_object(
                         dataset_metadata.get("cells_per_sample", [])
                     ),
-                    "sample_count": int(dataset_metadata.get("sample_count", len(added))),
+                    "sample_count": int(
+                        dataset_metadata.get("sample_count", len(added))
+                    ),
                 },
                 "labels": {"non_target_aliases": sorted(UNLABELED_VALUES)},
                 "stages": {"data_import": {}},
@@ -1129,10 +1081,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--transformation-cofactor",
         type=float,
-        default=None,
+        default=150.0,
         help=(
-            "Optional arcsinh cofactor. When set, apply arcsinh(x / cofactor) to all "
-            "non-label columns before packaging the imported CSVs."
+            "Arcsinh cofactor applied to all non-label columns before packaging "
+            "the imported CSVs (default: 150)."
         ),
     )
     parser.add_argument(

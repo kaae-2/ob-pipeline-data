@@ -50,7 +50,12 @@ The generated order metadata includes dataset-derived fields such as:
 - `platform` (single required value)
 - `expected_abbreviation` (single required value, derived from shortname)
 - `platforms` and `expected_abbreviations` are also emitted for compatibility and contain one item.
-- optional `transformation_cofactor` and `potential_batches` values when those CLI flags are provided
+- `transformation_cofactor` (150 by default) and optional `potential_batches`
+
+FCM imports default to `arcsinh(x / 150)`. Prepared datasets that require
+marker-specific cofactors store linearly scaled values so this one import rule
+reproduces their intended transforms. An explicit CLI cofactor overrides 150;
+the benchmark uses 5 for CyTOF datasets.
 
 ## Run locally
 
